@@ -1,0 +1,25 @@
+{
+  "name": "@redstars/mobile",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "sync": "npx cap sync android",
+    "sync:dev": "cp capacitor.config.dev.ts capacitor.config.ts && npx cap sync android",
+    "sync:prod": "git checkout capacitor.config.ts && npx cap sync android",
+    "open": "npx cap open android",
+    "run": "npx cap run android",
+    "build": "cd android && ./gradlew assembleDebug",
+    "build:release": "cd android && ./gradlew assembleRelease",
+    "build:dev": "npm run sync:dev && cd android && ./gradlew assembleDebug",
+    "build:prod": "npm run sync:prod && cd android && ./gradlew assembleRelease"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.0.0",
+    "@capacitor/core": "^6.0.0",
+    "capacitor-native-biometric": "^4.2.2"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.0.0",
+    "typescript": "^5.0.0"
+  }
+}

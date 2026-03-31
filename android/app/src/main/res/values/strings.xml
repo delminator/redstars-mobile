@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">RedStars</string>
+    <string name="title_activity_main">RedStars</string>
+    <string name="package_name">com.redstars.app</string>
+    <string name="custom_url_scheme">com.redstars.app</string>
+</resources>

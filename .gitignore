@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+*.log
+*.apk
+
+# Local IDE config
+.idea/
+*.iml
+
+# Keep Android project in git (Capacitor recommends this)
+# android/ is tracked
