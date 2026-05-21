@@ -1,0 +1,78 @@
+name: Build APK
+
+# Builds the Capacitor Android APK and, on a version tag, publishes it as a
+# GitHub Release asset named `redstars.apk`. The backend (`/api/v1/agents`)
+# and the frontend download button both expect that exact asset name at
+# `releases/latest/download/redstars.apk`.
+#
+#   - push a tag `vX.Y.Z`  -> build + publish a release
+#   - manual run           -> build only (artifact), no release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup JDK 17
+        # Capacitor 6 / Android Gradle Plugin 8.2.1 require JDK 17.
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Capacitor sync
+        # Regenerates capacitor.settings.gradle / capacitor.build.gradle
+        # against this runner's node_modules and copies web assets.
+        run: npx cap sync android
+
+      - name: Build debug APK
+        # Debug-signed: installable by sideload (the "unknown sources"
+        # prompt is expected). No release keystore to manage yet.
+        run: |
+          chmod +x android/gradlew
+          cd android
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Stage APK as redstars.apk
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk redstars.apk
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: redstars-apk
+          path: redstars.apk
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" redstars.apk \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "RedStars Mobile ${GITHUB_REF_NAME}" \
+            --notes "APK Capacitor — WebView de dev.redstars.redlinks.fr.
+          Debug-signée : à l'installation, autoriser les sources inconnues.
+          Asset: redstars.apk"
