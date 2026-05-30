@@ -49,42 +49,44 @@ class RedstarsHelperPlugin : Plugin() {
     override fun load() {
         super.load()
         val ctx = context
-        try {
-            if (!Python.isStarted()) {
-                Python.start(AndroidPlatform(ctx))
-            }
-            // Cache app-privé : tous les états runtime du helper (refs/,
-            // iso/, decoded/, certs matérialisés) atterrissent ici.
-            val cacheDir = File(ctx.cacheDir, "redstars-helper").apply { mkdirs() }
-            // helper.py lit ces 2 env vars pour savoir où écrire ; on
-            // les passe à la VM Python via `os.environ` au démarrage.
-            val py = Python.getInstance()
-            val osModule = py.getModule("os")
-            val environ = osModule["environ"]!!
-            environ.callAttr("__setitem__", "XDG_CACHE_HOME", cacheDir.parentFile?.absolutePath ?: cacheDir.absolutePath)
-            environ.callAttr("__setitem__", "REDSTARS_HELPER_PLATFORM", "android")
-            // Spawn helper.main() en daemon — il a sa boucle HTTPServer
-            // propre et bind 0.0.0.0:49080 + 49443.
-            Thread {
-                try {
-                    py.getModule("helper").callAttr("main")
-                } catch (e: PyException) {
-                    Log.e(TAG, "helper.py crashed", e)
-                    startupError.set("helper.py: ${e.message}")
-                } catch (e: Throwable) {
-                    Log.e(TAG, "Python thread died", e)
-                    startupError.set("python thread: ${e.message}")
+        // TOUT init Python tourne en background thread daemon. Sur le
+        // premier lancement Chaquopy extrait ses libs natives
+        // (libpython3.11.so ~5 Mo) — ça peut prendre 3-5 s, et la
+        // synchronisation avec l'init du Capacitor Bridge fait que
+        // l'Activity gèle → la WebView ne s'affiche pas du tout
+        // (« page couldn't load »).
+        Thread {
+            try {
+                if (!Python.isStarted()) {
+                    Log.i(TAG, "Starting Python runtime (first launch may take 3-5 s)")
+                    Python.start(AndroidPlatform(ctx))
                 }
-            }.apply {
-                isDaemon = true
-                name = "redstars-helper"
-                start()
+                // Cache app-privé : refs/, iso/, decoded/, certs matérialisés.
+                val cacheDir = File(ctx.cacheDir, "redstars-helper").apply { mkdirs() }
+                val py = Python.getInstance()
+                val osModule = py.getModule("os")
+                val environ = osModule["environ"]!!
+                environ.callAttr(
+                    "__setitem__", "XDG_CACHE_HOME",
+                    cacheDir.parentFile?.absolutePath ?: cacheDir.absolutePath
+                )
+                environ.callAttr("__setitem__", "REDSTARS_HELPER_PLATFORM", "android")
+                started = true
+                Log.i(TAG, "Python runtime ready, launching helper.main()")
+                // helper.main() bind 0.0.0.0:49080 + 127.0.0.1:49443 et
+                // boucle en serve_forever() — tient le thread vivant.
+                py.getModule("helper").callAttr("main")
+            } catch (e: PyException) {
+                Log.e(TAG, "helper.py crashed", e)
+                startupError.set("helper.py: ${e.message}")
+            } catch (e: Throwable) {
+                Log.e(TAG, "Python init / helper thread died", e)
+                startupError.set("python init: ${e.message}")
             }
-            started = true
-            Log.i(TAG, "Python helper started in background thread")
-        } catch (e: Throwable) {
-            Log.e(TAG, "Failed to start Python runtime", e)
-            startupError.set("python init: ${e.message}")
+        }.apply {
+            isDaemon = true
+            name = "redstars-helper"
+            start()
         }
     }
 
