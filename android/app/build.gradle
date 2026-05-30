@@ -1,4 +1,6 @@
 apply plugin: 'com.android.application'
+apply plugin: 'com.chaquo.python'
+apply plugin: 'kotlin-android'
 
 android {
     namespace "com.redstars.app"
@@ -7,13 +9,38 @@ android {
         applicationId "com.redstars.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode 2
+        versionName "0.2.0"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
              // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
             ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+        }
+        // Chaquopy : on n'embarque que les 2 ABI qui couvrent ~100 %
+        // des téléphones modernes (arm64) + l'émulateur x86_64. ~25 Mo
+        // d'overhead total vs ~60 Mo si on inclut les 4 ABI.
+        ndk {
+            abiFilters "arm64-v8a", "x86_64"
+        }
+        python {
+            // Python 3.11 = la dernière supportée par Chaquopy 16.x.
+            version "3.11"
+            // Pip — vide pour MVP : helper.py marche en stdlib pure pour
+            // tous les endpoints I/O (status, refs, files/pick). Les
+            // endpoints codec /redEC + /redDEC importent torch+numpy en
+            // lazy ; ils renverront 500 explicite côté Android jusqu'à
+            // ce qu'on porte le pipeline en ONNX Runtime mobile.
+            pip {
+                // (à activer phase 2) install "numpy"
+                // (à activer phase 3) install "onnxruntime"
+            }
+        }
+    }
+    sourceSets {
+        main {
+            // Sources Python : android/app/src/main/python/helper.py
+            python.srcDir "src/main/python"
         }
     }
     buildTypes {

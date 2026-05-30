@@ -37,6 +37,14 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Setup Python 3.11
+        # Chaquopy `buildPython` lit le Python du host à la résolution
+        # gradle. La `version "3.11"` déclarée dans android/app/build.gradle
+        # DOIT matcher la version sur le runner sinon le sync plante.
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
