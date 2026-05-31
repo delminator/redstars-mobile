@@ -39,15 +39,29 @@ class RedstarsHelperPlugin : Plugin() {
         private const val TAG = "RedstarsHelper"
         // Version du shell APK — affichée à la UI, pas le helper.py
         // (cette version-là est dans helper.py lui-même).
-        private const val SHELL_VERSION = "0.2.0-android"
+        private const val SHELL_VERSION = "0.2.2-android"
         // Erreur de démarrage si crash au boot. Atomic : lu depuis le
         // thread Capacitor (call.resolve), écrit depuis le thread Python.
         private val startupError = AtomicReference<String?>(null)
         @Volatile private var started = false
+        // Vrai une fois que helper.main() a été spawné dans CE process.
+        // Survit aux multiples appels à load() (Capacitor recrée
+        // l'instance du plugin quand l'app revient au foreground après un
+        // long sommeil) → on évite de relancer helper.main() qui
+        // crasherait sur EADDRINUSE et marquerait à tort startupError.
+        @Volatile private var helperSpawned = false
     }
 
     override fun load() {
         super.load()
+        if (helperSpawned) {
+            // Helper déjà lancé plus tôt dans ce process — Python tourne,
+            // serve_forever() boucle, on a juste à refléter \`started\`.
+            started = true
+            Log.i(TAG, "load() re-entry : helper.main() déjà spawné, skip")
+            return
+        }
+        helperSpawned = true
         val ctx = context
         // TOUT init Python tourne en background thread daemon. Sur le
         // premier lancement Chaquopy extrait ses libs natives
