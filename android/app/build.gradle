@@ -9,8 +9,8 @@ android {
         applicationId "com.redstars.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 4
-        versionName "0.2.2"
+        versionCode 5
+        versionName "0.2.3"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -26,14 +26,12 @@ android {
         python {
             // Python 3.11 = la dernière supportée par Chaquopy 16.x.
             version "3.11"
-            // Pip — vide pour MVP : helper.py marche en stdlib pure pour
-            // tous les endpoints I/O (status, refs, files/pick). Les
-            // endpoints codec /redEC + /redDEC importent torch+numpy en
-            // lazy ; ils renverront 500 explicite côté Android jusqu'à
-            // ce qu'on porte le pipeline en ONNX Runtime mobile.
+            // numpy : utilisé par redEC.py + redDEC.py + nn_numpy.py.
+            // Pas de torch (pas de wheel Android) — le forward pass est
+            // réimplémenté en numpy pur dans nn_numpy.py, ~27k params
+            // de poids dans weights_{lat,img}.npz.
             pip {
-                // (à activer phase 2) install "numpy"
-                // (à activer phase 3) install "onnxruntime"
+                install "numpy"
             }
         }
     }
