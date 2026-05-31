@@ -3,6 +3,7 @@ package com.redstars.app
 import android.content.Context
 import android.util.Base64
 import android.util.Log
+import org.bouncycastle.crypto.digests.Blake2bDigest
 import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
 import org.bouncycastle.crypto.signers.Ed25519Signer
 import org.json.JSONArray
@@ -203,14 +204,18 @@ object ScriptUpdater {
         return sb.toString()
     }
 
-    /** Verify a minisign legacy ("Ed") Ed25519 signature.
-     *  Pubkey line format (base64): "Ed" magic (2B) + keyId (8B) + pubkey (32B)
-     *  Signature file format (text) :
+    /** Verify a minisign signature. Handles BOTH algos minisign emits:
+     *    - modern "ED" (Ed25519 over BLAKE2b-512(content)) — what
+     *      `minisign -S` produces by default since v0.10, what our CI emits
+     *    - legacy "Ed" (Ed25519 over raw content bytes)
+     *
+     *  Pubkey line format (base64): algo (2B) + keyId (8B) + pubkey (32B)
+     *  Signature file format (text):
      *    untrusted comment: <…>
-     *    base64(Ed magic + keyId + 64B signature)
+     *    base64(algo (2B) + keyId (8B) + 64B signature)
      *    trusted comment: <…>
      *    base64(64B trusted-comment signature)        ← we don't verify this
-     *  We only verify the FIRST base64 line over the raw script bytes. */
+     *  We only verify the FIRST base64 line. */
     private fun verifyMinisign(script: ByteArray, signature: ByteArray): Boolean {
         return try {
             val pubBytes = Base64.decode(PUBKEY_LINE, Base64.DEFAULT)
@@ -236,6 +241,7 @@ object ScriptUpdater {
                 Log.e(TAG, "bad sig length ${sigBytes.size}, expected 74")
                 return false
             }
+            val sigAlgo = sigBytes.sliceArray(0..1)
             val sigKeyId = sigBytes.sliceArray(2..9)
             if (!pubKeyId.contentEquals(sigKeyId)) {
                 Log.e(TAG, "key id mismatch")
@@ -243,9 +249,20 @@ object ScriptUpdater {
             }
             val ed25519Sig = sigBytes.sliceArray(10..73)
 
+            // ED → BLAKE2b-512 prehash ; Ed (legacy) → raw bytes.
+            val msg = if (sigAlgo[0] == 'E'.code.toByte() && sigAlgo[1] == 'D'.code.toByte()) {
+                val digest = Blake2bDigest(512)
+                digest.update(script, 0, script.size)
+                val out = ByteArray(64)
+                digest.doFinal(out, 0)
+                out
+            } else {
+                script
+            }
+
             val verifier = Ed25519Signer()
             verifier.init(false, pubKey)
-            verifier.update(script, 0, script.size)
+            verifier.update(msg, 0, msg.size)
             verifier.verifySignature(ed25519Sig)
         } catch (e: Throwable) {
             Log.e(TAG, "verifyMinisign threw", e)

@@ -39,7 +39,7 @@ class RedstarsHelperPlugin : Plugin() {
         private const val TAG = "RedstarsHelper"
         // Version du shell APK — affichée à la UI, pas le helper.py
         // (cette version-là est dans helper.py lui-même).
-        private const val SHELL_VERSION = "0.2.5-android"
+        private const val SHELL_VERSION = "0.2.6-android"
         // Erreur de démarrage si crash au boot. Atomic : lu depuis le
         // thread Capacitor (call.resolve), écrit depuis le thread Python.
         private val startupError = AtomicReference<String?>(null)

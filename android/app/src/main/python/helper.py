@@ -42,7 +42,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHan
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 
-VERSION = '0.5.14'
+VERSION = '0.5.17'
 PORT = int(os.environ.get('HELPER_PORT', '49080'))
 HTTPS_PORT = int(os.environ.get('HELPER_HTTPS_PORT', '49443'))
 DEMO_DIR = Path(__file__).resolve().parent
@@ -259,6 +259,164 @@ MOUNTED = {}  # iso_id → {'iso_path','mount_path','dev','label','created_at'}
 # juste des liens symboliques. Cleanup à la demande via /helper/refs/unmount.
 REFS_CACHE_DIR = Path.home() / '.cache' / 'redstars-helper' / 'refs'
 REFS = {}  # refs_id → {'dir_path','label','sources':[...],'created_at'}
+
+# Jobs longs (décodage chaîne Red3/Red4 : 1M+ appels redDEC). On les
+# spawn dans un thread, le client poll /redDEC-job/<id>.
+JOBS = {}  # job_id → {kind, status: 'running'|'done'|'failed',
+           #           progress: 0..1, started_at, done_at?,
+           #           error?, result?: MountInfo}
+JOBS_LOCK = threading.Lock()
+
+def _new_job(kind: str) -> str:
+    job_id = uuid.uuid4().hex[:12]
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            'kind': kind,
+            'status': 'running',
+            'progress': 0.0,
+            'started_at': time.time(),
+        }
+    return job_id
+
+def _job_set(job_id: str, **kw):
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            JOBS[job_id].update(kw)
+
+
+def _redDEC_chain_worker(job_id: str, hash_hex: str, level: int,
+                         name: str, target_size):
+    """Worker thread pour /redDEC-chain. Sortie 1024^level hashes ×
+    1024 octets ≈ 1024^(level+1) octets, truncate à `target_size`."""
+    try:
+        # Total d'appels redDEC attendus = somme géométrique.
+        total_calls = sum(1024**i for i in range(level))  # 1, 1025, ~1M, ~1G
+        calls_done = 0
+
+        def report_progress():
+            with JOBS_LOCK:
+                if job_id in JOBS:
+                    JOBS[job_id]['progress'] = min(0.99, calls_done / max(1, total_calls))
+
+        # Short-circuit dès qu'on a assez de hashes pour couvrir
+        # `bytes_needed` octets utiles à la sortie. Après l'étape `step`,
+        # chaque hash dans `current` se développera en 1024^(level-step)
+        # octets — donc on a besoin de ceil(bytes_needed / 1024^(level-step))
+        # hashes max. Pour un tar de 11 GiB en Red3 :
+        #     step 0 (avant 2 itérations restantes) → 11 hashes suffisent
+        #     step 1 (avant 1 itération restante)   → 11 264 hashes
+        #     step 2 (sortie finale)                → 11 534 336 leaves = 11 GiB
+        # Total ~11k appels redDEC au lieu de 1M+, ET on n'écrit JAMAIS
+        # plus que bytes_needed octets sur disque.
+        bytes_needed = int(target_size) if target_size and int(target_size) > 0 else None
+
+        current = [bytes.fromhex(hash_hex)]
+        for step in range(level):
+            nxt = []
+            mult_after_step = 1024 ** (level - step)  # ce qu'un hash de nxt deviendra
+            for h in current:
+                decoded = _CODEC['redDEC'](h)  # 1 Mo
+                calls_done += 1
+                if calls_done % 32 == 0:
+                    report_progress()
+                for i in range(1024):
+                    nxt.append(decoded[i*1024:(i+1)*1024])
+                if bytes_needed and len(nxt) * mult_after_step >= bytes_needed:
+                    break
+            current = nxt
+
+        # On limite current AVANT le join — sinon b''.join(1M hashes) =
+        # 1 GiB en RAM même si on truncate après.
+        if bytes_needed:
+            needed_hashes = -(-bytes_needed // 1024)  # ceil
+            current = current[:needed_hashes]
+        out_bytes = b''.join(current)
+        if bytes_needed:
+            out_bytes = out_bytes[:bytes_needed]
+
+        # Cache + mount.
+        cache_root = Path(os.environ.get('XDG_CACHE_HOME')
+                          or os.path.expanduser('~/.cache')) / 'redstars-helper' / 'decoded'
+        cache_root.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r'[^A-Za-z0-9._-]', '_', name)[:120] or 'decoded.bin'
+        out_path = cache_root / f'{hash_hex[:8]}-{safe}'
+        out_path.write_bytes(out_bytes)
+
+        # Détection bundle tar.
+        bundle_files = None
+        try:
+            if tarfile.is_tarfile(out_path):
+                extract_root = cache_root / f'{hash_hex[:8]}-bundle'
+                extract_root.mkdir(parents=True, exist_ok=True)
+                with tarfile.open(out_path) as tar:
+                    for m in tar.getmembers():
+                        if not m.isfile():
+                            continue
+                        if m.name.startswith('/') or '..' in Path(m.name).parts:
+                            continue
+                        tar.extract(m, extract_root, set_attrs=False)
+                bundle_files = sorted(
+                    f for f in extract_root.rglob('*') if f.is_file()
+                )
+        except (tarfile.TarError, OSError):
+            bundle_files = None
+
+        REFS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        refs_id  = uuid.uuid4().hex[:12]
+        if bundle_files:
+            label    = f'BUNDLE-Red{level}'
+            dir_path = REFS_CACHE_DIR / f'{label}-{refs_id}'
+            dir_path.mkdir(parents=True, exist_ok=False)
+            entries  = []
+            sources  = []
+            for src in bundle_files:
+                link = dir_path / src.name
+                i = 1
+                while link.exists():
+                    link = dir_path / f'{src.stem}-{i}{src.suffix}'
+                    i += 1
+                link.symlink_to(src)
+                entries.append({
+                    'name': link.name, 'path': str(link),
+                    'target': str(src), 'size': src.stat().st_size,
+                    'is_dir': False,
+                })
+                sources.append(str(src))
+            REFS[refs_id] = {
+                'dir_path': str(dir_path), 'label': label,
+                'sources': sources, 'created_at': time.time(),
+            }
+            result = {
+                'level': level, 'bundle': True,
+                'output_path': str(out_path), 'output_size': len(out_bytes),
+                'id': refs_id, 'mount_path': str(dir_path), 'label': label,
+                'entries': entries, 'n_files': len(entries),
+            }
+        else:
+            label    = f'DECODED-Red{level}'
+            dir_path = REFS_CACHE_DIR / f'{label}-{refs_id}'
+            dir_path.mkdir(parents=True, exist_ok=False)
+            link_target = dir_path / out_path.name
+            link_target.symlink_to(out_path)
+            REFS[refs_id] = {
+                'dir_path': str(dir_path), 'label': label,
+                'sources': [str(out_path)], 'created_at': time.time(),
+            }
+            result = {
+                'level': level, 'bundle': False,
+                'output_path': str(out_path), 'output_size': len(out_bytes),
+                'id': refs_id, 'mount_path': str(dir_path), 'label': label,
+                'entries': [{
+                    'name': link_target.name, 'path': str(link_target),
+                    'target': str(out_path), 'size': len(out_bytes),
+                    'is_dir': False,
+                }],
+            }
+        _job_set(job_id, status='done', progress=1.0, done_at=time.time(),
+                 result=result)
+    except Exception as e:
+        _job_set(job_id, status='failed', done_at=time.time(),
+                 error=f'{type(e).__name__}: {e}')
 
 def _recover_refs_from_disk():
     """Au boot, repeuple REFS depuis les sous-dossiers existants de
@@ -656,6 +814,16 @@ class Handler(SimpleHTTPRequestHandler):
         query = parse_qs(split.query)
         if ep == '/status':
             self._json(200, {'ok': True, 'version': VERSION})
+            return
+        if ep == '/redDEC-job':
+            # GET /redDEC-job?id=<job_id> — poll endpoint pour /redDEC-chain.
+            job_id = (query.get('id', ['']) or [''])[0]
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+                if job is None:
+                    self._json(404, {'error': 'unknown job id'}); return
+                snapshot = dict(job)
+            self._json(200, snapshot)
             return
         if ep == '/disk':
             # Espace dispo sur la partition qui hébergera les sorties.
@@ -1111,13 +1279,10 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if ep == '/redDEC-chain':
-            # Chaîne `level` applications de redDEC pour reconstruire le
-            # fichier d'origine. Niveau N → 1 + 1024 + … + 1024^(N-1)
-            # appels redDEC, sortie 1024^N octets (ré-tronquée par
-            # `size` si fournie). On écrit le résultat dans
-            # ~/.cache/redstars-helper/decoded/, on le monte direct via
-            # un /refs/, et on renvoie le mount au caller — un seul
-            # round-trip côté browser.
+            # POST → spawn un job thread, retourne {job_id} immédiatement.
+            # Le client poll /redDEC-job?id=<job_id> pour progress + résultat.
+            # Tous les niveaux sont async (cohérent) — Red1 finit en ~1 s,
+            # Red2 en minutes, Red3/4 en heures.
             err = _ensure_codec()
             if err:
                 self._json(500, {'error': f'codec load failed: {err}', 'hint': 'pip install torch numpy'}); return
@@ -1130,149 +1295,38 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(400, {'error': 'hash_hex must be exactly 2048 hex chars'}); return
             if level < 1 or level > 4:
                 self._json(400, {'error': 'level must be 1..4'}); return
-            if level > 2:
-                # ~1 M appels neuronaux pour Red3, ~1 G pour Red4. Hors
-                # de portée d'un serveur HTTP synchrone ; on refuse
-                # explicitement plutôt que de bloquer pendant des heures.
-                self._json(501, {
-                    'error': f'Red{level} unsupported pour l\'instant',
-                    'detail': f'{1024**(level-1)} appels redDEC nécessaires — '
-                              'faisable mais demande un job worker dédié, pas '
-                              'une requête HTTP. Red1/Red2 OK.',
+            # Pré-check disque AVANT de lancer le thread — on doit pouvoir
+            # écrire 1024^(level+1) octets (Red1 = 1 Mio … Red4 = 1 Pio).
+            expected_out = 1024 ** (level + 1)
+            cache_root = Path(os.environ.get('XDG_CACHE_HOME')
+                              or os.path.expanduser('~/.cache')) / 'redstars-helper' / 'decoded'
+            cache_root.mkdir(parents=True, exist_ok=True)
+            free = shutil.disk_usage(cache_root).free
+            if target_size and int(target_size) > 0:
+                # Si on connaît la vraie sortie utile, on check ça (Red3
+                # d'un 11 GiB tar n'a besoin que de 11 GiB libre).
+                needed = int(target_size)
+            else:
+                needed = expected_out
+            if free < int(needed * 1.1):
+                self._json(507, {
+                    'error': 'not enough free disk',
+                    'expected_output_bytes': needed,
+                    'free_bytes': free,
+                    'path': str(cache_root),
                 }); return
-            try:
-                # Pré-check : la sortie après `level` étapes redDEC contient
-                # 1024^level hashes × 1024 octets = 1024^(level+1) octets.
-                # Red1 = 1 Mio, Red2 = 1 Gio, Red3 = 1 Tio, Red4 = 1 Pio.
-                # Si on n'a clairement pas la place sur le disque cible,
-                # on refuse avant de lancer 1k+ appels neuronaux.
-                expected_out = 1024 ** (level + 1)
-                cache_root = Path(os.environ.get('XDG_CACHE_HOME')
-                                  or os.path.expanduser('~/.cache')) / 'redstars-helper' / 'decoded'
-                cache_root.mkdir(parents=True, exist_ok=True)
-                free = shutil.disk_usage(cache_root).free
-                # Marge de 10 % pour ne pas saturer la partition.
-                if free < int(expected_out * 1.1):
-                    self._json(507, {
-                        'error': 'not enough free disk',
-                        'expected_output_bytes': expected_out,
-                        'free_bytes': free,
-                        'path': str(cache_root),
-                    }); return
-                # Chaîne redDEC `level` fois. À chaque étape on découpe
-                # le 1 Mo de sortie en 1024 hashes filles.
-                current = [bytes.fromhex(hash_hex)]
-                for step in range(level):
-                    nxt = []
-                    for h in current:
-                        decoded = _CODEC['redDEC'](h)  # 1 Mo
-                        for i in range(1024):
-                            nxt.append(decoded[i*1024:(i+1)*1024])
-                    current = nxt
-                out_bytes = b''.join(current)
-                if target_size and int(target_size) > 0:
-                    out_bytes = out_bytes[:int(target_size)]
-
-                # Cache + mount.
-                cache_root = Path(os.environ.get('XDG_CACHE_HOME')
-                                  or os.path.expanduser('~/.cache')) / 'redstars-helper' / 'decoded'
-                cache_root.mkdir(parents=True, exist_ok=True)
-                safe = re.sub(r'[^A-Za-z0-9._-]', '_', name)[:120] or 'decoded.bin'
-                out_path = cache_root / f'{hash_hex[:8]}-{safe}'
-                out_path.write_bytes(out_bytes)
-
-                # Détection bundle : si la sortie est un tar (produit par
-                # /redEC/bundle), on extrait les fichiers à leurs noms
-                # d'origine et on monte le répertoire d'extraction. Sinon
-                # — payload mono-fichier legacy — on monte directement le
-                # blob comme avant.
-                bundle_files = None
-                try:
-                    if tarfile.is_tarfile(out_path):
-                        extract_root = cache_root / f'{hash_hex[:8]}-bundle'
-                        extract_root.mkdir(parents=True, exist_ok=True)
-                        with tarfile.open(out_path) as tar:
-                            for m in tar.getmembers():
-                                if not m.isfile():
-                                    continue
-                                # Refuse les paths absolus / parent — un bundle
-                                # malicieux ne doit pas pouvoir écrire ailleurs.
-                                if m.name.startswith('/') or '..' in Path(m.name).parts:
-                                    continue
-                                tar.extract(m, extract_root, set_attrs=False)
-                        bundle_files = sorted(
-                            f for f in extract_root.rglob('*') if f.is_file()
-                        )
-                except (tarfile.TarError, OSError):
-                    bundle_files = None
-
-                REFS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                refs_id  = uuid.uuid4().hex[:12]
-                if bundle_files:
-                    label    = f'BUNDLE-Red{level}'
-                    dir_path = REFS_CACHE_DIR / f'{label}-{refs_id}'
-                    dir_path.mkdir(parents=True, exist_ok=False)
-                    entries  = []
-                    sources  = []
-                    for src in bundle_files:
-                        link = dir_path / src.name
-                        # Évite collision si plusieurs membres tar ont le même
-                        # nom (après flatten rglob).
-                        i = 1
-                        while link.exists():
-                            link = dir_path / f'{src.stem}-{i}{src.suffix}'
-                            i += 1
-                        link.symlink_to(src)
-                        entries.append({
-                            'name': link.name, 'path': str(link),
-                            'target': str(src), 'size': src.stat().st_size,
-                            'is_dir': False,
-                        })
-                        sources.append(str(src))
-                    REFS[refs_id] = {
-                        'dir_path': str(dir_path), 'label': label,
-                        'sources': sources, 'created_at': time.time(),
-                    }
-                    self._json(200, {
-                        'ok': True, 'level': level, 'bundle': True,
-                        'output_path': str(out_path), 'output_size': len(out_bytes),
-                        'id': refs_id, 'mount_path': str(dir_path), 'label': label,
-                        'entries': entries, 'n_files': len(entries),
-                    })
-                    return
-
-                # Single-file legacy path — same as before.
-                label    = f'DECODED-Red{level}'
-                dir_path = REFS_CACHE_DIR / f'{label}-{refs_id}'
-                dir_path.mkdir(parents=True, exist_ok=False)
-                link_target = dir_path / out_path.name
-                link_target.symlink_to(out_path)
-                REFS[refs_id] = {
-                    'dir_path': str(dir_path),
-                    'label': label,
-                    'sources': [str(out_path)],
-                    'created_at': time.time(),
-                }
-                self._json(200, {
-                    'ok': True,
-                    'level': level,
-                    'bundle': False,
-                    'output_path': str(out_path),
-                    'output_size': len(out_bytes),
-                    'id': refs_id,
-                    'mount_path': str(dir_path),
-                    'label': label,
-                    'entries': [{
-                        'name': link_target.name,
-                        'path': str(link_target),
-                        'target': str(out_path),
-                        'size': len(out_bytes),
-                        'is_dir': False,
-                    }],
-                })
-            except Exception as e:
-                self._json(500, {'error': f'{type(e).__name__}: {e}'})
+            # Spawn worker thread, retourne le job_id au caller.
+            job_id = _new_job('redDEC-chain')
+            t = threading.Thread(
+                target=_redDEC_chain_worker,
+                args=(job_id, hash_hex, level, name, target_size),
+                daemon=True,
+                name=f'redDEC-{job_id[:8]}',
+            )
+            t.start()
+            self._json(202, {'ok': True, 'job_id': job_id, 'level': level})
             return
+
 
         if ep == '/refs/mount':
             body  = self._read_json()
@@ -1506,6 +1560,12 @@ def _serve_thread(server, label):
 
 
 def main():
+    # SO_REUSEADDR : sur Android, l'OS garde le socket 30-120 s en TIME_WAIT
+    # après un crash du process. Sans REUSEADDR, le redémarrage de l'app
+    # (auto-update du script_updater ou retour foreground) → EADDRINUSE
+    # → startupError → MobileBlocker. Idem desktop si le user relance le
+    # tray avant la fin du TIME_WAIT.
+    HTTPServer.allow_reuse_address = True
     # HTTP server on :8080 — page + helper API, same-origin path.
     http_srv = HTTPServer(('0.0.0.0', PORT), Handler)
     print(f'redstars-helper {VERSION}')
