@@ -39,7 +39,7 @@ class RedstarsHelperPlugin : Plugin() {
         private const val TAG = "RedstarsHelper"
         // Version du shell APK — affichée à la UI, pas le helper.py
         // (cette version-là est dans helper.py lui-même).
-        private const val SHELL_VERSION = "0.2.2-android"
+        private const val SHELL_VERSION = "0.2.5-android"
         // Erreur de démarrage si crash au boot. Atomic : lu depuis le
         // thread Capacitor (call.resolve), écrit depuis le thread Python.
         private val startupError = AtomicReference<String?>(null)
@@ -85,11 +85,39 @@ class RedstarsHelperPlugin : Plugin() {
                     cacheDir.parentFile?.absolutePath ?: cacheDir.absolutePath
                 )
                 environ.callAttr("__setitem__", "REDSTARS_HELPER_PLATFORM", "android")
+
+                // Auto-update : on tente une mise à jour avant de lancer
+                // helper.main(). Si le cache contient déjà la dernière
+                // version, ça n'écrit rien ; sinon download + verify +
+                // cache. Le check tourne en synchrone DANS ce thread (pas
+                // le main thread) — ajoute au plus 1-2 s au boot froid.
+                try {
+                    ScriptUpdater.checkAndUpdate(ctx)
+                } catch (e: Throwable) {
+                    Log.w(TAG, "ScriptUpdater threw (continuing with bundled)", e)
+                }
                 started = true
                 Log.i(TAG, "Python runtime ready, launching helper.main()")
-                // helper.main() bind 0.0.0.0:49080 + 127.0.0.1:49443 et
-                // boucle en serve_forever() — tient le thread vivant.
-                py.getModule("helper").callAttr("main")
+
+                // Sélectionne le helper.py à exécuter :
+                //   - cache (filesDir/redstars-helper/helper.py) si verify OK
+                //   - bundle (assets/chaquopy/...) sinon
+                // Pour charger depuis un path explicite on passe par
+                // importlib.util — `py.getModule("helper")` ne lit que les
+                // sources bundled dans l'APK.
+                val cached = ScriptUpdater.cachedScriptPath(ctx)
+                if (cached != null) {
+                    val cachedVer = ScriptUpdater.cachedScriptVersion(ctx)
+                    Log.i(TAG, "loading cached helper.py v$cachedVer from ${cached.absolutePath}")
+                    val util = py.getModule("importlib.util")
+                    val spec = util.callAttr("spec_from_file_location", "helper", cached.absolutePath)
+                    val mod = util.callAttr("module_from_spec", spec)
+                    spec["loader"]!!.callAttr("exec_module", mod)
+                    mod.callAttr("main")
+                } else {
+                    Log.i(TAG, "loading bundled helper.py (no valid cache)")
+                    py.getModule("helper").callAttr("main")
+                }
             } catch (e: PyException) {
                 Log.e(TAG, "helper.py crashed", e)
                 startupError.set("helper.py: ${e.message}")
@@ -114,12 +142,19 @@ class RedstarsHelperPlugin : Plugin() {
         val result = JSObject()
         result.put("ok", started && startupError.get() == null)
         result.put("shellVersion", SHELL_VERSION)
-        // scriptVersion : helper.py inscrit sa VERSION dans son module ;
-        // on la relit dynamiquement pour qu'un auto-update soit visible
-        // sans rebuilder l'APK.
+        // scriptVersion : si on a un cache, on lit la version-marker
+        // qui correspond au script effectivement chargé. Sinon on tombe
+        // sur le bundled `helper.VERSION` (la valeur compilée dans l'APK).
         try {
-            val pyVer = Python.getInstance().getModule("helper").get("VERSION")?.toString()
-            result.put("scriptVersion", pyVer ?: "unknown")
+            val cachedVer = ScriptUpdater.cachedScriptVersion(context)
+            if (cachedVer != null) {
+                result.put("scriptVersion", cachedVer)
+                result.put("scriptSource", "cache")
+            } else {
+                val pyVer = Python.getInstance().getModule("helper").get("VERSION")?.toString()
+                result.put("scriptVersion", pyVer ?: "unknown")
+                result.put("scriptSource", "bundle")
+            }
         } catch (e: Throwable) {
             result.put("scriptVersion", "unloaded")
         }
