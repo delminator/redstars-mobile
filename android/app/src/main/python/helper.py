@@ -8,7 +8,8 @@ LAN, private window) without CORS dance.
 Endpoints (all under /helper):
   GET  /helper/status         →  {"ok": true, "version": "..."}
   GET  /helper/lsusb          →  {"devices": [{bus, device, id, name}, ...]}
-  GET  /helper/scale          →  latest scale reading (cached)
+  GET  /helper/scale          →  scale reading (on-demand; the serial port is
+                                  opened only while the page keeps polling)
   POST /helper/enable-webgpu  →  appends WebGPU prefs to Firefox user.js
   POST /helper/reset-webgpu   →  removes WebGPU prefs
   POST /helper/redEC          →  body = binary file ; → {hash_hex, level} (auto Red1..Red4)
@@ -42,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHan
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 
-VERSION = '0.5.17'
+VERSION = '0.5.23'
 PORT = int(os.environ.get('HELPER_PORT', '49080'))
 HTTPS_PORT = int(os.environ.get('HELPER_HTTPS_PORT', '49443'))
 DEMO_DIR = Path(__file__).resolve().parent
@@ -105,19 +106,57 @@ ALLOWED_ORIGINS = {
 # Codec autoencoder (redEC/redDEC) — chargement paresseux à la 1ʳᵉ requête /helper/redEC ou /redDEC.
 # Permet au helper de démarrer même sans torch/numpy installés ; les routes renvoient une erreur
 # claire si la dépendance manque.
-_CODEC = {'loaded': False, 'redEC_chain': None, 'redDEC': None, 'err': None}
+_CODEC = {'loaded': False, 'redEC_chain': None, 'redDEC': None,
+          'encode_file': None, 'decode_file': None, 'backend': None,
+          'cascade_err': None, 'err': None}
+
+def _codec_dirs():
+    """Dirs that may hold the codec assets. helper.py auto-updates to the OS cache
+    dir (only helper.py there), so beyond DEMO_DIR we probe the env hint + the OS
+    bundle (rpm/deb productName dir, /opt, AppImage mount, macOS .app)."""
+    import glob as _glob
+    cands = [DEMO_DIR]
+    env = os.environ.get('REDSTARS_HELPER_BUNDLED_DIR')
+    if env:
+        cands.append(Path(env))
+    for pat in (
+        '/usr/lib/*/bundled/codec_onnx.py', '/usr/lib/*/resources/bundled/codec_onnx.py',
+        '/usr/share/*/bundled/codec_onnx.py', '/opt/*/bundled/codec_onnx.py',
+        '/tmp/.mount_*/usr/lib/*/bundled/codec_onnx.py',
+        '/Applications/*.app/Contents/Resources/bundled/codec_onnx.py',
+        str(Path.home() / 'Applications' / '*.app' / 'Contents' / 'Resources' / 'bundled' / 'codec_onnx.py'),
+    ):
+        for hit in _glob.glob(pat):
+            cands.append(Path(hit).parent)
+    return cands
 
 def _ensure_codec():
     if _CODEC['loaded'] or _CODEC['err']:
         return _CODEC['err']
     try:
         import sys as _sys
-        if str(DEMO_DIR) not in _sys.path:
-            _sys.path.insert(0, str(DEMO_DIR))
-        from redEC import redEC_chain
-        from redDEC import redDEC
-        _CODEC['redEC_chain'] = redEC_chain
-        _CODEC['redDEC'] = redDEC
+        for d in _codec_dirs():
+            if (d / 'codec_onnx.py').is_file() or (d / 'codec_numpy.py').is_file() or (d / 'redEC.py').is_file():
+                if str(d) not in _sys.path:
+                    _sys.path.insert(0, str(d))
+                break
+        # Codec lossless PORTABLE (sidecar de correction → bit-exact) : ONNX (rapide,
+        # multi-thread CPU, sans torch) → numpy (secours si pas d'onnxruntime).
+        try:
+            import codec_onnx as _cf; _CODEC['backend'] = 'onnx'
+        except Exception:
+            import codec_numpy as _cf; _CODEC['backend'] = 'numpy'
+        _CODEC['encode_file'] = _cf.encode_file
+        _CODEC['decode_file'] = _cf.decode_file
+        # Cascade redEC/redDEC (1 hash ↔ 1024) — OPTIONNELLE, nécessite torch. Si torch
+        # absent (machine portable), le blob lossless marche quand même.
+        try:
+            from redEC import redEC_chain
+            from redDEC import redDEC
+            _CODEC['redEC_chain'] = redEC_chain
+            _CODEC['redDEC'] = redDEC
+        except Exception as _te:
+            _CODEC['cascade_err'] = f'{type(_te).__name__}: {_te}'
         _CODEC['loaded'] = True
         return None
     except Exception as e:
@@ -131,69 +170,138 @@ SCALE_LINE = re.compile(r'(?P<status>[A-Z]{2,4})\s*(?P<sign>[+-])(?P<value>\d+(?
 
 
 class ScaleReader:
-    """Background thread reading the scale's serial output and caching the
-    latest stable value. /scale endpoint just returns the cache.
+    """On-demand serial scale reader. There is NO 24/7 background polling: the
+    serial port is opened lazily on the first /scale request and kept open only
+    while the page keeps requesting. A single self-rescheduling idle timer (one
+    wake every IDLE_CLOSE_SECS, ONLY while in use) closes the port a few seconds
+    after the last read, so the helper goes fully dormant — zero threads, zero
+    wakeups — when the scale isn't being used. The web page drives the cadence
+    (poll ~1/s while the weighing screen is open).
 
-    Auto-reconnects if the serial port disappears (unplug/replug).
+    Cheap CH340 scales stream weight lines continuously while powered, so each
+    read drains the serial buffer and returns the freshest line.
     """
+    IDLE_CLOSE_SECS = 5
+
     def __init__(self, port=SCALE_PORT, baud=SCALE_BAUD):
         self.port = port
         self.baud = baud
         self.lock = threading.Lock()
-        self.state = {
+        self._ser = None
+        self._timer = None
+        self._last_request = 0.0
+        self._last = {
             'connected': False, 'value': None, 'unit': None, 'sign': None,
             'status': None, 'raw': None, 'updated_at': None, 'error': None,
         }
-        self._stop = threading.Event()
-        threading.Thread(target=self._run, daemon=True).start()
 
-    def _set(self, **kw):
-        with self.lock:
-            self.state.update(kw)
-
-    def get(self):
-        with self.lock:
-            return dict(self.state)
-
-    def _run(self):
-        try:
-            import serial
-        except ImportError:
-            self._set(error='pyserial not installed (pip install --user pyserial)')
-            return
-        while not self._stop.is_set():
+    # --- port lifecycle (caller holds self.lock) -------------------------
+    def _close(self):
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        if self._ser is not None:
             try:
-                with serial.Serial(self.port, self.baud, timeout=1) as ser:
-                    self._set(connected=True, error=None)
-                    while not self._stop.is_set():
-                        raw = ser.readline().decode('ascii', errors='replace').strip()
-                        if not raw:
-                            continue
-                        m = SCALE_LINE.search(raw)
-                        if m:
-                            sign = -1 if m.group('sign') == '-' else 1
-                            self._set(
-                                connected=True,
-                                value=sign * float(m.group('value')),
-                                unit=(m.group('unit') or 'g').lower(),
-                                sign=m.group('sign'),
-                                status=m.group('status'),
-                                raw=raw,
-                                updated_at=time.time(),
-                                error=None,
-                            )
-                        else:
-                            # Boot messages, blank lines, etc — keep raw for debug
-                            self._set(raw=raw, updated_at=time.time(), error=None)
-            except FileNotFoundError:
-                self._set(connected=False, error=f'{self.port} not present (scale unplugged?)')
-                time.sleep(2)
-            except PermissionError:
-                self._set(connected=False, error=f'{self.port} permission denied (udev rule?)')
-                time.sleep(5)
+                self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+
+    def _arm_timer(self):
+        t = threading.Timer(self.IDLE_CLOSE_SECS, self._on_timer)
+        t.daemon = True
+        self._timer = t
+        t.start()
+
+    def _on_timer(self):
+        # Close if no read happened recently; otherwise keep watching. This is
+        # the ONLY recurring wake, and only while the scale is actively in use.
+        with self.lock:
+            self._timer = None
+            if time.time() - self._last_request >= self.IDLE_CLOSE_SECS:
+                self._close()
+            else:
+                self._arm_timer()
+
+    # --- public API ------------------------------------------------------
+    def read(self):
+        """Open on demand, drain to the freshest line, return the reading.
+        The port auto-closes IDLE_CLOSE_SECS after the last call."""
+        with self.lock:
+            self._last_request = time.time()
+            if self._ser is None:
+                try:
+                    import serial
+                except ImportError:
+                    self._last = dict(self._last, connected=False,
+                                      error='pyserial not installed (pip install --user pyserial)')
+                    return dict(self._last)
+                try:
+                    self._ser = serial.Serial(self.port, self.baud, timeout=0.4)
+                except FileNotFoundError:
+                    self._last = dict(self._last, connected=False,
+                                      error=f'{self.port} not present (scale unplugged?)')
+                    return dict(self._last)
+                except PermissionError:
+                    self._last = dict(self._last, connected=False,
+                                      error=f'{self.port} permission denied (udev rule?)')
+                    return dict(self._last)
+                except Exception as e:
+                    self._last = dict(self._last, connected=False,
+                                      error=type(e).__name__ + ': ' + str(e))
+                    return dict(self._last)
+            ser = self._ser
+            try:
+                latest_raw = None
+                latest_m = None
+                # Drain everything buffered so we return the FRESHEST line.
+                while ser.in_waiting:
+                    raw = ser.readline().decode('ascii', errors='replace').strip()
+                    if not raw:
+                        continue
+                    latest_raw = raw
+                    m = SCALE_LINE.search(raw)
+                    if m:
+                        latest_m = m
+                if latest_raw is None:
+                    # Nothing buffered yet — one short blocking read.
+                    raw = ser.readline().decode('ascii', errors='replace').strip()
+                    if raw:
+                        latest_raw = raw
+                        latest_m = SCALE_LINE.search(raw)
             except Exception as e:
-                self._set(connected=False, error=type(e).__name__ + ': ' + str(e))
-                time.sleep(2)
+                self._close()
+                self._last = dict(self._last, connected=False,
+                                  error=type(e).__name__ + ': ' + str(e))
+                return dict(self._last)
+
+            if latest_m:
+                sign = -1 if latest_m.group('sign') == '-' else 1
+                self._last = {
+                    'connected': True,
+                    'value': sign * float(latest_m.group('value')),
+                    'unit': (latest_m.group('unit') or 'g').lower(),
+                    'sign': latest_m.group('sign'),
+                    'status': latest_m.group('status'),
+                    'raw': latest_raw,
+                    'updated_at': time.time(),
+                    'error': None,
+                }
+            elif latest_raw is not None:
+                # Boot message / blank — keep raw for debug, mark connected.
+                self._last = dict(self._last, connected=True, raw=latest_raw,
+                                  updated_at=time.time(), error=None)
+            else:
+                # Port open but no data this round — keep last value.
+                self._last = dict(self._last, connected=True, error=None)
+
+            if self._timer is None:
+                self._arm_timer()
+            return dict(self._last)
+
+    # Back-compat alias (old callers used .get()).
+    def get(self):
+        return self.read()
 
 
 SCALE = ScaleReader()
@@ -284,6 +392,124 @@ def _job_set(job_id: str, **kw):
             JOBS[job_id].update(kw)
 
 
+# --- File-codec blob store (the tested lossless chain: codec.py + sidecar) ----
+# Save  : files → make_iso → encode_file → blob (RSN1 + patch trailer) persisted here.
+# Restore: blob → decode_file → iso → mount. The blob is the shareable artifact
+# (~source size, lossless 1:1 — NOT a tiny hash; no contraction, no dropping).
+BLOB_DIR = (Path(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'))
+            / 'redstars-helper' / 'blobs')
+
+def _iso_payload_from_paths(abs_paths):
+    used, payload, files_meta = set(), {}, []
+    for src in abs_paths:
+        nm = Path(src).name
+        if nm in used:
+            base, ext = os.path.splitext(nm); i = 1
+            while f'{base}-{i}{ext}' in used: i += 1
+            nm = f'{base}-{i}{ext}'
+        used.add(nm); payload[nm] = src
+        files_meta.append({'name': nm, 'size': os.path.getsize(src)})
+    return payload, files_meta
+
+def _codec_encode_worker(job_id, abs_paths, label):
+    """ISO → blob lossless (codec_file_torch) + CASCADE redEC → 1 hash unique.
+    Le hash est la contraction redEC (les 1024 hashes → 1), miroir de redDEC ; on
+    le remonte via /redDEC-chain (1 hash → 1024 → … → 1 Go). Contraction lossy sur
+    données arbitraires (assumé pour l'instant) — le blob reste l'artefact exact."""
+    try:
+        payload, files_meta = _iso_payload_from_paths(abs_paths)
+        iso_path = make_iso(label, payload=payload)
+        # Tamponner la zone système ISO (1024 o de tête, ignorée par les lecteurs ISO)
+        # avec un en-tête NON-NUL dérivé du contenu → redEC_chain sort un hash non-nul
+        # ET distinct par disque (sinon l'ISO commence par des zéros → hash nul).
+        import hashlib as _hl
+        sig = _hl.sha256(repr(files_meta).encode() + label.encode()).digest()
+        stamp = (b'RSDISK1\x00' + sig + label.encode()[:48]).ljust(1024, b'\xa5')[:1024]
+        with open(iso_path, 'r+b') as f:
+            f.seek(0); f.write(stamp)
+        source_bytes = iso_path.stat().st_size
+        BLOB_DIR.mkdir(parents=True, exist_ok=True)
+        blob_id = uuid.uuid4().hex[:16]
+        blob_path = BLOB_DIR / f'{blob_id}.rsn'
+        _, n_patches = _CODEC['encode_file'](str(iso_path), str(blob_path))   # lossless (ISO tamponnée)
+        # CASCADE redEC : ISO (1024 hashes/blocs) → 1 hash unique (Red1..Red4).
+        # OPTIONNELLE : nécessite torch. Sans torch, on ne fournit que le blob.
+        share = {}
+        if not _CODEC.get('redEC_chain'):
+            share = {'share_error': 'cascade indisponible (torch absent — blob seul)'}
+        else:
+            try:
+                import tempfile as _tf
+                out_h = Path(_tf.gettempdir()) / f'redec-{uuid.uuid4().hex[:8]}.bin'
+                lvl, h, insize = _CODEC['redEC_chain'](iso_path, out_h)
+                share = {'share_hash_hex': h.hex(), 'share_level': lvl, 'share_bundle': insize}
+                try: out_h.unlink(missing_ok=True)
+                except Exception: pass
+            except Exception as e:
+                share = {'share_error': f'{type(e).__name__}: {e}'}
+        try: iso_path.unlink(missing_ok=True)
+        except Exception: pass
+        _job_set(job_id, status='done', progress=1.0, done_at=time.time(), result={
+            'blob_id': blob_id,
+            'blob_bytes': blob_path.stat().st_size,
+            'source_bytes': source_bytes,
+            'patches': n_patches,
+            'n_files': len(files_meta),
+            'files': files_meta,
+            'label': label,
+            **share,
+        })
+    except Exception as e:
+        _job_set(job_id, status='failed', done_at=time.time(), error=f'{type(e).__name__}: {e}')
+
+def _decode_blob_and_mount(blob_path, label):
+    """decode_file(blob) → iso → mount. Returns the MountInfo-shaped result dict."""
+    ISO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    iso_id = uuid.uuid4().hex[:12]
+    iso_path = ISO_CACHE_DIR / f'{iso_id}.iso'
+    _CODEC['decode_file'](str(blob_path), str(iso_path))
+    mount_path, dev, mount_error = None, None, None
+    try:
+        mount_path, dev = mount_iso(iso_path)
+        MOUNTED[iso_id] = {'iso_path': str(iso_path), 'mount_path': mount_path,
+                           'dev': dev, 'label': label or 'BUNDLE', 'created_at': time.time()}
+    except Exception as e:
+        mount_error = f'{type(e).__name__}: {e}'
+    result = {'id': iso_id, 'iso_path': str(iso_path), 'mount_path': mount_path,
+              'label': label or 'BUNDLE', 'output_size': iso_path.stat().st_size,
+              'entries': list_mount(mount_path) if mount_path else []}
+    if mount_error: result['mount_error'] = mount_error
+    return result
+
+def _codec_restore_worker(job_id, blob_id, label):
+    """blob (par id, stocké helper-side) → decode → mount."""
+    try:
+        blob_path = BLOB_DIR / f'{blob_id}.rsn'
+        if not blob_path.is_file():
+            _job_set(job_id, status='failed', done_at=time.time(), error=f'no such blob: {blob_id}'); return
+        _job_set(job_id, status='done', progress=1.0, done_at=time.time(),
+                 result=_decode_blob_and_mount(blob_path, label))
+    except Exception as e:
+        _job_set(job_id, status='failed', done_at=time.time(), error=f'{type(e).__name__}: {e}')
+
+def _codec_restore_data_worker(job_id, blob_bytes, label):
+    """blob collé (base64, venu d'ailleurs) → decode → mount. Pour tester un blob
+    encodé sur une autre machine sans qu'il soit déjà dans le store local."""
+    try:
+        if blob_bytes[:4] != b'RSN1':
+            _job_set(job_id, status='failed', done_at=time.time(), error='blob invalide (magic ≠ RSN1)'); return
+        BLOB_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = BLOB_DIR / f'paste-{uuid.uuid4().hex[:12]}.rsn'
+        tmp.write_bytes(blob_bytes)
+        try:
+            _job_set(job_id, status='done', progress=1.0, done_at=time.time(),
+                     result=_decode_blob_and_mount(tmp, label))
+        finally:
+            try: tmp.unlink(missing_ok=True)
+            except Exception: pass
+    except Exception as e:
+        _job_set(job_id, status='failed', done_at=time.time(), error=f'{type(e).__name__}: {e}')
+
 def _redDEC_chain_worker(job_id: str, hash_hex: str, level: int,
                          name: str, target_size):
     """Worker thread pour /redDEC-chain. Sortie 1024^level hashes ×
@@ -342,76 +568,46 @@ def _redDEC_chain_worker(job_id: str, hash_hex: str, level: int,
         out_path = cache_root / f'{hash_hex[:8]}-{safe}'
         out_path.write_bytes(out_bytes)
 
-        # Détection bundle tar.
-        bundle_files = None
+        # Les `out_bytes` SONT directement les bytes d'une iso 9660 / UDF
+        # (l'encode redEC porte sur l'iso construite côté envoi, pas sur
+        # un tar). Le système de fichiers ISO porte sa propre table
+        # d'index — on monte la sortie telle quelle et l'utilisateur
+        # retrouve ses fichiers à la racine, sans cache local ni sidecar
+        # de métadonnées (c.-à-d. ça marche sur n'importe quelle machine
+        # qui reçoit juste le hash + le bundle_size).
+        ISO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        iso_label = f'BUNDLE-Red{level}'
+        iso_id = uuid.uuid4().hex[:12]
+        iso_path = ISO_CACHE_DIR / f'{iso_id}.iso'
+        shutil.move(str(out_path), str(iso_path))
+        mount_path = None
+        dev = None
+        mount_error = None
         try:
-            if tarfile.is_tarfile(out_path):
-                extract_root = cache_root / f'{hash_hex[:8]}-bundle'
-                extract_root.mkdir(parents=True, exist_ok=True)
-                with tarfile.open(out_path) as tar:
-                    for m in tar.getmembers():
-                        if not m.isfile():
-                            continue
-                        if m.name.startswith('/') or '..' in Path(m.name).parts:
-                            continue
-                        tar.extract(m, extract_root, set_attrs=False)
-                bundle_files = sorted(
-                    f for f in extract_root.rglob('*') if f.is_file()
-                )
-        except (tarfile.TarError, OSError):
-            bundle_files = None
-
-        REFS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        refs_id  = uuid.uuid4().hex[:12]
-        if bundle_files:
-            label    = f'BUNDLE-Red{level}'
-            dir_path = REFS_CACHE_DIR / f'{label}-{refs_id}'
-            dir_path.mkdir(parents=True, exist_ok=False)
-            entries  = []
-            sources  = []
-            for src in bundle_files:
-                link = dir_path / src.name
-                i = 1
-                while link.exists():
-                    link = dir_path / f'{src.stem}-{i}{src.suffix}'
-                    i += 1
-                link.symlink_to(src)
-                entries.append({
-                    'name': link.name, 'path': str(link),
-                    'target': str(src), 'size': src.stat().st_size,
-                    'is_dir': False,
-                })
-                sources.append(str(src))
-            REFS[refs_id] = {
-                'dir_path': str(dir_path), 'label': label,
-                'sources': sources, 'created_at': time.time(),
+            mount_path, dev = mount_iso(iso_path)
+            MOUNTED[iso_id] = {
+                'iso_path': str(iso_path),
+                'mount_path': mount_path,
+                'dev': dev,
+                'label': iso_label,
+                'created_at': time.time(),
             }
-            result = {
-                'level': level, 'bundle': True,
-                'output_path': str(out_path), 'output_size': len(out_bytes),
-                'id': refs_id, 'mount_path': str(dir_path), 'label': label,
-                'entries': entries, 'n_files': len(entries),
-            }
-        else:
-            label    = f'DECODED-Red{level}'
-            dir_path = REFS_CACHE_DIR / f'{label}-{refs_id}'
-            dir_path.mkdir(parents=True, exist_ok=False)
-            link_target = dir_path / out_path.name
-            link_target.symlink_to(out_path)
-            REFS[refs_id] = {
-                'dir_path': str(dir_path), 'label': label,
-                'sources': [str(out_path)], 'created_at': time.time(),
-            }
-            result = {
-                'level': level, 'bundle': False,
-                'output_path': str(out_path), 'output_size': len(out_bytes),
-                'id': refs_id, 'mount_path': str(dir_path), 'label': label,
-                'entries': [{
-                    'name': link_target.name, 'path': str(link_target),
-                    'target': str(out_path), 'size': len(out_bytes),
-                    'is_dir': False,
-                }],
-            }
+        except Exception as e:
+            # Mount KO = la sortie cascade n'est pas une iso valide (codec
+            # a perdu des bits sur une entrée non cascade-valide, ou
+            # bundle_size faux). On garde quand même le .iso sur disque
+            # pour debug et on remonte l'erreur au client — pas de
+            # fallback `payload.bin` muet qui ferait croire à un succès.
+            mount_error = f'{type(e).__name__}: {e}'
+        result = {
+            'level': level,
+            'output_path': str(iso_path), 'output_size': len(out_bytes),
+            'id': iso_id, 'mount_path': mount_path, 'label': iso_label,
+            'iso_path': str(iso_path),
+            'entries': list_mount(mount_path) if mount_path else [],
+        }
+        if mount_error:
+            result['mount_error'] = mount_error
         _job_set(job_id, status='done', progress=1.0, done_at=time.time(),
                  result=result)
     except Exception as e:
@@ -486,7 +682,21 @@ def make_iso(label='REDSTARS', payload=None):
                 safe = Path(str(name)).name  # strip path components
                 if not safe:
                     continue
-                (src_dir / safe).write_bytes(bytes(data))
+                dst = src_dir / safe
+                # data peut être :
+                #   - bytes / bytearray   → write direct
+                #   - str / Path qui pointe vers un fichier existant
+                #                          → copy stream (films de plusieurs
+                #                          Gio sans charger en RAM)
+                if isinstance(data, (bytes, bytearray)):
+                    dst.write_bytes(bytes(data))
+                else:
+                    src_path = Path(str(data))
+                    if src_path.is_file():
+                        shutil.copyfile(src_path, dst)
+                    else:
+                        # Fallback : on tente bytes()
+                        dst.write_bytes(bytes(data))
         # else (None) → src_dir stays empty → empty filesystem
 
         tool = next((t for t in ('xorrisofs', 'genisoimage', 'mkisofs')
@@ -690,10 +900,36 @@ def _verify_minisign(content, sig_text):
     return ed25519_verify(pub32, sig64, msg)
 
 
+def _user_helper_cache_path() -> Path:
+    """Chemin où le Tauri shell lit helper.py EN PRIORITÉ (avant le bundled
+    root-owned). Cf. src-tauri/src/script_updater.rs::cache_path et
+    AppHandle::app_local_data_dir() :
+      - Linux   : $XDG_DATA_HOME/<bundle_id>/helper.py
+                  ou ~/.local/share/<bundle_id>/helper.py
+      - macOS   : ~/Library/Application Support/<bundle_id>/helper.py
+      - Windows : %LOCALAPPDATA%\\<bundle_id>\\helper.py
+    bundle_id = 'fr.redlinks.redstars-helper' (tauri.conf.json#identifier)."""
+    bundle_id = 'fr.redlinks.redstars-helper'
+    sysname = platform.system()
+    if sysname == 'Linux':
+        base = Path(os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share'))
+    elif sysname == 'Darwin':
+        base = Path.home() / 'Library' / 'Application Support'
+    elif sysname == 'Windows':
+        base = Path(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~/AppData/Local'))
+    else:
+        base = Path.home() / '.local' / 'share'
+    return base / bundle_id / 'helper.py'
+
+
 def update_self(api_base='https://api.dev.redstars.redlinks.fr'):
     """Pull the latest signed helper.py from the platform, verify, and
-    write it next to the running script. Returns a dict describing the
-    outcome (caller respawns via execv if `updated` is True)."""
+    write it into the USER cache that the Tauri shell loads in priority
+    (cf. `_user_helper_cache_path`). On NE TOUCHE PAS le bundled root-owned
+    `/usr/lib/Redstars Helper/bundled/helper.py` — le shell est codé pour
+    préférer le cache user au bundled, donc écrire là suffit. Returns a
+    dict describing the outcome (caller respawns via execv if `updated`
+    is True ; au prochain restart du shell le nouveau helper.py est chargé)."""
     import urllib.request, hashlib
     try:
         info_url = api_base.rstrip('/') + '/api/v1/agents/script-latest?name=helper.py'
@@ -718,13 +954,24 @@ def update_self(api_base='https://api.dev.redstars.redlinks.fr'):
             return {'updated': False, 'error': f'sha256 mismatch: expected {expected[:16]}…, got {got[:16]}…'}
     if not _verify_minisign(script_bytes, sig_text):
         return {'updated': False, 'error': 'minisign verification failed (or cryptography lib missing)'}
-    target = Path(__file__).resolve()
+    # On VISE le cache user, jamais le bundled root-owned. Le Tauri shell
+    # lit cache user > bundled dans script_updater.rs (resolution order).
+    # Le helper.py qui tourne là maintenant continue de tourner ; l'update
+    # prend effet au prochain restart du shell.
+    target = _user_helper_cache_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        return {'updated': False, 'error': f'mkdir {target.parent}: {e}'}
     if not os.access(target.parent, os.W_OK):
         return {'updated': False, 'error': f'cannot write to {target.parent}'}
     tmp = target.with_suffix('.py.tmp')
     try:
         tmp.write_bytes(script_bytes)
         os.replace(tmp, target)
+        # Le shell utilise ce marker pour afficher la version chargée
+        # dans le statut + skipper le fetch si déjà à jour au prochain boot.
+        (target.parent / 'helper.version').write_text(new_version)
     except Exception as e:
         return {'updated': False, 'error': f'write failed: {e}'}
     return {
@@ -825,6 +1072,25 @@ class Handler(SimpleHTTPRequestHandler):
                 snapshot = dict(job)
             self._json(200, snapshot)
             return
+        if ep == '/codec/blob':
+            # GET /codec/blob?id=<blob_id> — récupère le blob encodé pour le tester
+            # ailleurs. base64 si petit (≤256 Ko → copiable/QR), sinon taille + chemin.
+            blob_id = (query.get('id', ['']) or [''])[0]
+            if not re.fullmatch(r'[0-9a-f]{8,32}', blob_id):
+                self._json(400, {'error': 'id required (hex)'}); return
+            bp = BLOB_DIR / f'{blob_id}.rsn'
+            if not bp.is_file():
+                self._json(404, {'error': f'no such blob: {blob_id}'}); return
+            sz = bp.stat().st_size
+            # ≤8 Mo → base64 copiable (clipboard). Au-delà → trop gros, on rend
+            # juste le chemin (le blob est un fichier à copier tel quel). QR jamais
+            # possible : une ISO fait ≥376 Ko, un QR plafonne ~3 Ko.
+            if sz > 8 * 1024 * 1024:
+                self._json(200, {'ok': True, 'blob_id': blob_id, 'blob_bytes': sz,
+                                 'too_big': True, 'path': str(bp)}); return
+            import base64 as _b64
+            self._json(200, {'ok': True, 'blob_id': blob_id, 'blob_bytes': sz,
+                             'blob_b64': _b64.b64encode(bp.read_bytes()).decode('ascii')}); return
         if ep == '/disk':
             # Espace dispo sur la partition qui hébergera les sorties.
             # ?path=<…> ou défaut = le cache redstars-helper (= là où
@@ -844,7 +1110,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(500, {'error': f'{type(e).__name__}: {e}'})
             return
         if ep == '/scale':
-            state = SCALE.get()
+            state = SCALE.read()
             if state.get('updated_at'):
                 state['age_ms'] = int((time.time() - state['updated_at']) * 1000)
             self._json(200, state)
@@ -1211,47 +1477,132 @@ class Handler(SimpleHTTPRequestHandler):
                 abs_paths.append(src)
             import tempfile
             with tempfile.TemporaryDirectory() as td:
-                bundle_path = Path(td) / 'bundle.tar'
-                out_path    = Path(td) / 'out.bin'
-                files_meta  = []
-                seen        = set()
-                # Format PAX : supporte les linknames > 100 chars qui font
-                # crasher USTAR (les /refs/ ont des paths longs). dereference
-                # = True : on tar le CONTENU des cibles, pas les symlinks
-                # eux-mêmes — c'est ce qu'on veut, le mount /refs/ ne sert
-                # que d'agrégation, le payload est les vrais fichiers.
-                with tarfile.open(bundle_path, 'w', format=tarfile.PAX_FORMAT) as tar:
-                    tar.dereference = True
-                    for src in abs_paths:
-                        name = Path(src).name
-                        if name in seen:
-                            base, ext = os.path.splitext(name)
-                            i = 1
-                            while f'{base}-{i}{ext}' in seen:
-                                i += 1
-                            name = f'{base}-{i}{ext}'
-                        seen.add(name)
-                        try:
-                            tar.add(src, arcname=name)
-                        except Exception as e:
-                            self._json(500, {'error': f'tar add failed for {name}: {type(e).__name__}: {e}'}); return
-                        files_meta.append({'name': name, 'size': os.path.getsize(src)})
-                bundle_size = bundle_path.stat().st_size
+                out_path = Path(td) / 'out.bin'
+                # On construit l'iso d'ABORD avec le dict {nom: src_path}
+                # — make_iso stream-copy chaque fichier (pas de RAM bloat
+                # pour les gros films). Les bytes de cette iso SONT ce
+                # qu'on passe à redEC_chain : pas de tar intermédiaire.
+                # Au décode l'arbre du système de fichiers ISO 9660 / UDF
+                # sert d'index — n'importe quelle machine qui reçoit le
+                # hash + le bundle_size peut remonter l'iso et retrouver
+                # les fichiers d'origine sans cache ni sidecar local.
+                iso_label = (body.get('label') or 'REDSTARS')[:32]
+                iso_payload = {}
+                used = set()
+                files_meta = []
+                for src in abs_paths:
+                    nm = Path(src).name
+                    if nm in used:
+                        base, ext = os.path.splitext(nm)
+                        i = 1
+                        while f'{base}-{i}{ext}' in used:
+                            i += 1
+                        nm = f'{base}-{i}{ext}'
+                    used.add(nm)
+                    iso_payload[nm] = src
+                    files_meta.append({'name': nm, 'size': os.path.getsize(src)})
                 try:
-                    level, h, _ = _CODEC['redEC_chain'](bundle_path, out_path)
-                    self._json(200, {
-                        'ok': True,
-                        'level': f'Red{level}',
-                        'n_chain_steps': level,
-                        'output_hash_hex': h.hex(),
-                        'output_bytes': len(h),
-                        'bundle_bytes': bundle_size,
-                        'n_files': len(files_meta),
-                        'files': files_meta,
-                    })
+                    iso_path = make_iso(iso_label, payload=iso_payload)
                 except Exception as e:
-                    self._json(500, {'error': f'{type(e).__name__}: {e}'})
+                    self._json(500, {'error': f'make_iso failed: {type(e).__name__}: {e}'}); return
+                bundle_size = iso_path.stat().st_size
+                try:
+                    level, h, _ = _CODEC['redEC_chain'](iso_path, out_path)
+                except Exception as e:
+                    self._json(500, {'error': f'{type(e).__name__}: {e}'}); return
+                iso_id = uuid.uuid4().hex[:12]
+                iso_info = None
+                try:
+                    mount_path, dev = mount_iso(iso_path)
+                    MOUNTED[iso_id] = {
+                        'iso_path': str(iso_path),
+                        'mount_path': mount_path,
+                        'dev': dev,
+                        'label': iso_label,
+                        'created_at': time.time(),
+                    }
+                    iso_info = {
+                        'iso_id': iso_id,
+                        'mount_path': mount_path,
+                        'label': iso_label,
+                        'entries': list_mount(mount_path),
+                    }
+                except Exception as e:
+                    # ISO mount best-effort côté envoi — si udisksctl manque
+                    # ou échoue on garde quand même le hash redEC pour le
+                    # partage. La sortie reste réceptionnable côté décode.
+                    iso_info = {'error': f'iso mount failed: {type(e).__name__}: {e}'}
+                self._json(200, {
+                    'ok': True,
+                    'level': f'Red{level}',
+                    'n_chain_steps': level,
+                    'output_hash_hex': h.hex(),
+                    'output_bytes': len(h),
+                    'bundle_bytes': bundle_size,
+                    'n_files': len(files_meta),
+                    'files': files_meta,
+                    'iso': iso_info,
+                })
             return
+
+        if ep == '/codec/encode':
+            # Save : files → make_iso → encode_file → blob (lossless). Async job.
+            err = _ensure_codec()
+            if err:
+                self._json(500, {'error': f'codec load failed: {err}', 'hint': 'pip install torch numpy'}); return
+            body  = self._read_json()
+            paths = body.get('paths') or []
+            label = (body.get('label') or 'REDSTARS')[:32]
+            if not paths:
+                self._json(400, {'error': 'paths required'}); return
+            abs_paths = []
+            for p in paths:
+                src = os.path.normpath(os.path.abspath(p))
+                allowed = any(
+                    src == os.path.normpath(os.path.abspath(info['dir_path'])) or
+                    src.startswith(os.path.normpath(os.path.abspath(info['dir_path'])) + os.sep)
+                    for info in REFS.values())
+                if not allowed:
+                    self._json(403, {'error': f'path not under any active /refs/ mount: {p}'}); return
+                if not os.path.isfile(src):
+                    self._json(404, {'error': f'no such file: {src}'}); return
+                abs_paths.append(src)
+            job_id = _new_job('codec-encode')
+            threading.Thread(target=_codec_encode_worker, args=(job_id, abs_paths, label), daemon=True).start()
+            self._json(200, {'job_id': job_id}); return
+
+        if ep == '/codec/restore':
+            # Remonter : blob → decode_file → iso → mount (lossless). Async job.
+            err = _ensure_codec()
+            if err:
+                self._json(500, {'error': f'codec load failed: {err}', 'hint': 'pip install torch numpy'}); return
+            body    = self._read_json()
+            blob_id = (body.get('blob_id') or '').strip()
+            label   = (body.get('label') or 'BUNDLE')[:32]
+            if not re.fullmatch(r'[0-9a-f]{8,32}', blob_id):
+                self._json(400, {'error': 'blob_id required (hex)'}); return
+            job_id = _new_job('codec-restore')
+            threading.Thread(target=_codec_restore_worker, args=(job_id, blob_id, label), daemon=True).start()
+            self._json(200, {'job_id': job_id}); return
+
+        if ep == '/codec/restore-data':
+            # Remonter un blob COLLÉ (base64, encodé ailleurs). Async job.
+            err = _ensure_codec()
+            if err:
+                self._json(500, {'error': f'codec load failed: {err}', 'hint': 'pip install torch numpy'}); return
+            body  = self._read_json()
+            b64   = (body.get('blob_b64') or '').strip()
+            label = (body.get('label') or 'BUNDLE')[:32]
+            import base64 as _b64
+            try:
+                data = _b64.b64decode(b64, validate=True)
+            except Exception:
+                self._json(400, {'error': 'blob_b64 invalide (base64)'}); return
+            if len(data) < 12 or data[:4] != b'RSN1':
+                self._json(400, {'error': 'blob invalide (magic ≠ RSN1)'}); return
+            job_id = _new_job('codec-restore-data')
+            threading.Thread(target=_codec_restore_data_worker, args=(job_id, data, label), daemon=True).start()
+            self._json(200, {'job_id': job_id}); return
 
         if ep == '/redDEC':
             err = _ensure_codec()
@@ -1433,7 +1784,15 @@ class Handler(SimpleHTTPRequestHandler):
             refs_id = body.get('id', '')
             info = REFS.get(refs_id)
             if not info:
-                self._json(404, {'error': 'unknown id'}); return
+                # Fallback : depuis 0.5.18 le decode et le bundle save
+                # construisent une vraie iso via make_iso → l'entry vit
+                # dans MOUNTED, pas REFS. Aligne la forme attendue par la
+                # suite (dir_path).
+                m = MOUNTED.get(refs_id)
+                if m:
+                    info = {'dir_path': m['mount_path'], 'label': m.get('label', '')}
+                else:
+                    self._json(404, {'error': 'unknown id'}); return
             target = body.get('path') or info['dir_path']
             # Path must sit under the refs dir we created. We use absolute() +
             # normpath, NOT resolve() — the refs are symlinks pointing OUTSIDE
@@ -1554,7 +1913,11 @@ class Handler(SimpleHTTPRequestHandler):
 def _serve_thread(server, label):
     print(f'  {label}: ready')
     try:
-        server.serve_forever()
+        # poll_interval=30 (default 0.5): serve_forever wakes only to re-check
+        # an internal shutdown flag we never set (the helper exits via signal /
+        # process kill, not server.shutdown()). A long interval keeps the agent
+        # dormant — a few wakeups per minute instead of ~2/s — when idle.
+        server.serve_forever(poll_interval=30)
     except Exception as e:
         print(f'  {label} crashed: {e}')
 
@@ -1593,7 +1956,7 @@ def main():
     else:
         print('  HTTPS: skipped — no cert.pem/key.pem on disk and embedded fallback failed')
     try:
-        http_srv.serve_forever()
+        http_srv.serve_forever(poll_interval=30)  # see _serve_thread: stay dormant when idle
     except KeyboardInterrupt:
         print('\nbye')
 
