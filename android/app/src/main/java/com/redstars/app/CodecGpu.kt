@@ -11,27 +11,26 @@ import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 
 /**
- * Inférence GPU du codec 32×32 via TFLite (delegate GPU → NNAPI → CPU).
- *
- * Appelé depuis le helper Python (Chaquopy) UNIQUEMENT sur Android :
- *   from com.redstars.app import CodecGpu
- *   CodecGpu.decode(latent_bytes) -> index_bytes
+ * Inférence du codec 32×32 via TFLite (delegate GPU → NNAPI → CPU), en FLOAT et
+ * en INT8 (PTQ, bit-exact vs float vérifié). Appelé depuis le helper Python
+ * (Chaquopy) sur Android. Les modèles int8 ont la MÊME signature I/O que les
+ * float (input float32, output int32) → le code de décode est partagé.
  *
  * Layout binaire identique à codec_numpy (vérifié bit-exact en Python) :
- *   - decode : par patch, 1024 o latent → 8192 bits MSB-first (np.unpackbits),
- *     rangés en NHWC [32,32,8] via k→(c=k/1024, h=(k%1024)/32, w=(k%1024)%32) ;
- *     dec32.tflite → argmax → [32,32] indices → 1024 o.
- *   - encode : 1024 o (indices) → bits LSB-first (to_bits : bit c = idx>>c) en
- *     NHWC ; enc32.tflite → round → 8192 bits packés MSB-first ordre NCHW → 1024 o.
+ *   decode : 1024 o latent → 8192 bits MSB-first → NHWC [32,32,8] →
+ *            dec.tflite → argmax → [32,32] indices → 1024 o.
  */
 object CodecGpu {
-    private const val B = 64            // batch fixe (modèles exportés en [64,32,32,8])
-    private const val PATCH = 1024      // octets par patch / bloc latent
+    private const val B = 64
+    private const val PATCH = 1024
     private const val BITS = 8192
 
     private var enc: Interpreter? = null
     private var dec: Interpreter? = null
+    private var encI8: Interpreter? = null
+    private var decI8: Interpreter? = null
     @Volatile private var backendName = "none"
+    @Volatile private var backendI8 = "none"
     @Volatile private var loadError: String? = null
 
     @JvmStatic
@@ -39,23 +38,29 @@ object CodecGpu {
     fun init(ctx: Context) {
         if (dec != null || loadError != null) return
         try {
-            val encBuf = loadAsset(ctx, "enc32.tflite")
-            val decBuf = loadAsset(ctx, "dec32.tflite")
-            // GPU → NNAPI → CPU (XNNPACK), chacun avec sa propre Options/delegate.
-            for (mode in listOf("gpu", "nnapi", "cpu")) {
-                try {
-                    enc = Interpreter(encBuf, optionsFor(mode))
-                    dec = Interpreter(decBuf, optionsFor(mode))
-                    backendName = mode
-                    return
-                } catch (e: Throwable) {
-                    enc = null; dec = null
-                }
-            }
-            loadError = "aucun backend TFLite n'a pu charger"
+            // modèles FLOAT (requis)
+            val (fp, fmode) = loadPair(loadAsset(ctx, "enc32.tflite"), loadAsset(ctx, "dec32.tflite"))
+            if (fp == null) { loadError = "float : aucun backend TFLite n'a pu charger"; return }
+            enc = fp.first; dec = fp.second; backendName = fmode
+            // modèles INT8 (best-effort, pour le bench / le gain NPU)
+            try {
+                val (ip, imode) = loadPair(loadAsset(ctx, "enc32_int8.tflite"), loadAsset(ctx, "dec32_int8.tflite"))
+                if (ip != null) { encI8 = ip.first; decI8 = ip.second; backendI8 = imode }
+            } catch (t: Throwable) { backendI8 = "absent" }
         } catch (e: Throwable) {
             loadError = "${e.javaClass.simpleName}: ${e.message}"
         }
+    }
+
+    private fun loadPair(encBuf: MappedByteBuffer, decBuf: MappedByteBuffer): Pair<Pair<Interpreter, Interpreter>?, String> {
+        for (mode in listOf("gpu", "nnapi", "cpu")) {
+            try {
+                val e = Interpreter(encBuf, optionsFor(mode))
+                val d = Interpreter(decBuf, optionsFor(mode))
+                return Pair(Pair(e, d), mode)
+            } catch (t: Throwable) { /* try next */ }
+        }
+        return Pair(null, "none")
     }
 
     private fun optionsFor(mode: String): Interpreter.Options {
@@ -70,7 +75,7 @@ object CodecGpu {
 
     @JvmStatic
     fun status(): String =
-        loadError?.let { "error: $it" } ?: "ok backend=$backendName"
+        loadError?.let { "error: $it" } ?: "ok float=$backendName int8=$backendI8"
 
     private fun loadAsset(ctx: Context, name: String): MappedByteBuffer {
         ctx.assets.openFd(name).use { afd ->
@@ -83,43 +88,36 @@ object CodecGpu {
     private fun newFloatIn() = ByteBuffer.allocateDirect(B * 32 * 32 * 8 * 4).order(ByteOrder.nativeOrder())
     private fun newIntOut() = ByteBuffer.allocateDirect(B * 32 * 32 * 4).order(ByteOrder.nativeOrder())
 
-    /** latentBytes (N*1024) → indexBytes (N*1024). */
-    @JvmStatic
-    @Synchronized
-    fun decode(latentBytes: ByteArray): ByteArray {
-        val d = dec ?: throw IllegalStateException("CodecGpu non init (${status()})")
+    /** Décode avec l'interpréteur fourni (float ou int8, même I/O). latent (N*1024) → indices (N*1024). */
+    private fun decodeWith(d: Interpreter, latentBytes: ByteArray): ByteArray {
         val n = latentBytes.size / PATCH
         val out = ByteArray(n * PATCH)
         val inBuf = newFloatIn()
         val outBuf = newIntOut()
+        val zero = FloatArray(32 * 32 * 8)
         var batch = 0
         while (batch < n) {
             val bsz = minOf(B, n - batch)
             inBuf.rewind()
             val fin = inBuf.asFloatBuffer()
-            // remplit [B,32,32,8] (les patchs >= bsz restent à 0)
-            val zero = FloatArray(32 * 32 * 8)
             for (p in 0 until B) {
                 if (p < bsz) {
                     val base = (batch + p) * PATCH
-                    val patchFloats = FloatArray(32 * 32 * 8)
+                    val pf = FloatArray(32 * 32 * 8)
                     for (k in 0 until BITS) {
                         val bit = (latentBytes[base + (k ushr 3)].toInt() ushr (7 - (k and 7))) and 1
                         val rem = k and 1023; val h = rem ushr 5; val w = rem and 31; val c = k ushr 10
-                        patchFloats[(h * 32 + w) * 8 + c] = bit.toFloat()
+                        pf[(h * 32 + w) * 8 + c] = bit.toFloat()
                     }
-                    fin.put(patchFloats)
-                } else {
-                    fin.put(zero)
-                }
+                    fin.put(pf)
+                } else fin.put(zero)
             }
             inBuf.rewind(); outBuf.rewind()
             d.run(inBuf, outBuf)
             outBuf.rewind()
             val iout = outBuf.asIntBuffer()
             for (p in 0 until bsz) {
-                val base = (batch + p) * PATCH
-                val off = p * 1024
+                val base = (batch + p) * PATCH; val off = p * 1024
                 for (hw in 0 until 1024) out[base + hw] = iout.get(off + hw).toByte()
             }
             batch += bsz
@@ -127,7 +125,15 @@ object CodecGpu {
         return out
     }
 
-    /** patchBytes (N*1024 indices) → latentBytes (N*1024). */
+    /** latentBytes (N*1024) → indexBytes (N*1024). Utilise le décodeur FLOAT. */
+    @JvmStatic
+    @Synchronized
+    fun decode(latentBytes: ByteArray): ByteArray {
+        val d = dec ?: throw IllegalStateException("CodecGpu non init (${status()})")
+        return decodeWith(d, latentBytes)
+    }
+
+    /** patchBytes (N*1024 indices) → latentBytes (N*1024). Encodeur FLOAT. */
     @JvmStatic
     @Synchronized
     fun encode(patchBytes: ByteArray): ByteArray {
@@ -135,13 +141,13 @@ object CodecGpu {
         val n = patchBytes.size / PATCH
         val out = ByteArray(n * PATCH)
         val inBuf = newFloatIn()
-        val outBuf = newFloatIn()  // sortie enc = [B,32,32,8] float (bits 0/1)
+        val outBuf = newFloatIn()
+        val zero = FloatArray(32 * 32 * 8)
         var batch = 0
         while (batch < n) {
             val bsz = minOf(B, n - batch)
             inBuf.rewind()
             val fin = inBuf.asFloatBuffer()
-            val zero = FloatArray(32 * 32 * 8)
             for (p in 0 until B) {
                 if (p < bsz) {
                     val base = (batch + p) * PATCH
@@ -149,7 +155,7 @@ object CodecGpu {
                     for (hw in 0 until 1024) {
                         val v = patchBytes[base + hw].toInt() and 0xFF
                         val o = hw * 8
-                        for (c in 0 until 8) pf[o + c] = ((v ushr c) and 1).toFloat()  // to_bits LSB
+                        for (c in 0 until 8) pf[o + c] = ((v ushr c) and 1).toFloat()
                     }
                     fin.put(pf)
                 } else fin.put(zero)
@@ -160,14 +166,12 @@ object CodecGpu {
             val fout = outBuf.asFloatBuffer()
             for (p in 0 until bsz) {
                 val base = (batch + p) * PATCH
-                // packbits MSB-first en ordre NCHW : k→(c,h,w)
                 for (byteI in 0 until 1024) {
                     var b = 0
                     for (bit in 0 until 8) {
                         val k = byteI * 8 + bit
                         val rem = k and 1023; val h = rem ushr 5; val w = rem and 31; val c = k ushr 10
-                        val v = fout.get(p * (32 * 32 * 8) + (h * 32 + w) * 8 + c)
-                        if (v >= 0.5f) b = b or (1 shl (7 - bit))
+                        if (fout.get(p * (32 * 32 * 8) + (h * 32 + w) * 8 + c) >= 0.5f) b = b or (1 shl (7 - bit))
                     }
                     out[base + byteI] = b.toByte()
                 }
@@ -177,13 +181,38 @@ object CodecGpu {
         return out
     }
 
-    /** Self-test + bench : n patchs aléatoires, round-trip dec(enc(x)), renvoie un résumé. */
+    /** Bench FLOAT vs INT8 du décode sur n latents aléatoires : Mo/s, speedup, mismatch int8/float. */
+    @JvmStatic
+    fun benchInt8(n: Int): String {
+        try {
+            val d = dec ?: return "float dec non chargé (${status()})"
+            val di8 = decI8 ?: return "int8 dec non chargé (asset enc32_int8/dec32_int8 manquant ?) — ${status()}"
+            val rnd = java.util.Random(2)
+            val lat = ByteArray(n * PATCH).also { rnd.nextBytes(it) }
+            decodeWith(d, ByteArray(PATCH)); decodeWith(di8, ByteArray(PATCH))  // warmup
+            var t = System.nanoTime()
+            val of = decodeWith(d, lat)
+            val fMs = (System.nanoTime() - t) / 1e6
+            t = System.nanoTime()
+            val oi = decodeWith(di8, lat)
+            val iMs = (System.nanoTime() - t) / 1e6
+            var mism = 0
+            for (k in 0 until n * PATCH) if (of[k] != oi[k]) mism++
+            val mb = n * 1024.0 / 1e6
+            return "n=$n | FLOAT[$backendName] ${"%.0f".format(fMs)}ms=${"%.2f".format(mb / (fMs / 1000))}Mo/s " +
+                "| INT8[$backendI8] ${"%.0f".format(iMs)}ms=${"%.2f".format(mb / (iMs / 1000))}Mo/s " +
+                "| speedup=${"%.2f".format(fMs / iMs)}x | int8_vs_float_mismatch=$mism/${n * PATCH}o"
+        } catch (e: Throwable) {
+            return "benchInt8 error: ${e.javaClass.simpleName}: ${e.message}"
+        }
+    }
+
+    /** Self-test : round-trip dec(enc(x)) sur le chemin FLOAT. */
     @JvmStatic
     fun selfTest(n: Int): String {
         try {
             val rnd = java.util.Random(1)
             val patches = ByteArray(n * PATCH).also { rnd.nextBytes(it) }
-            // warmup
             decode(encode(ByteArray(PATCH).also { rnd.nextBytes(it) }))
             var t = System.nanoTime()
             val lat = encode(patches)
@@ -192,7 +221,7 @@ object CodecGpu {
             val back = decode(lat)
             val decMs = (System.nanoTime() - t) / 1e6
             var mism = 0
-            for (i in 0 until n * PATCH) if (back[i] != patches[i]) { mism++ }
+            for (i in 0 until n * PATCH) if (back[i] != patches[i]) mism++
             val mb = n * 1024.0 / 1e6
             return "backend=$backendName n=$n enc=${"%.0f".format(encMs)}ms(${"%.1f".format(mb / (encMs / 1000))}Mo/s) " +
                 "dec=${"%.0f".format(decMs)}ms(${"%.1f".format(mb / (decMs / 1000))}Mo/s) mism=$mism/${n * PATCH}o"

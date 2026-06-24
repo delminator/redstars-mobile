@@ -44,7 +44,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHan
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 
-VERSION = '0.5.27'
+VERSION = '0.5.28'
 PORT = int(os.environ.get('HELPER_PORT', '49080'))
 HTTPS_PORT = int(os.environ.get('HELPER_HTTPS_PORT', '49443'))
 DEMO_DIR = Path(__file__).resolve().parent
@@ -1230,6 +1230,20 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(200, {
                     'status': str(CodecGpu.status()),
                     'result': str(CodecGpu.selfTest(n)),
+                })
+            except Exception as e:
+                self._json(500, {'error': f'{type(e).__name__}: {e}'})
+            return
+        if ep == '/codec/int8-bench':
+            # Compare FLOAT vs INT8 du décode codec sur le NPU (CodecGpu.benchInt8).
+            if os.environ.get('REDSTARS_HELPER_PLATFORM') != 'android':
+                self._json(200, {'skip': 'desktop — pas de CodecGpu natif'}); return
+            try:
+                from com.redstars.app import CodecGpu
+                n = max(64, min(8192, int((query.get('n', ['2048']) or ['2048'])[0])))
+                self._json(200, {
+                    'status': str(CodecGpu.status()),
+                    'result': str(CodecGpu.benchInt8(n)),
                 })
             except Exception as e:
                 self._json(500, {'error': f'{type(e).__name__}: {e}'})
