@@ -133,6 +133,14 @@ object CodecGpu {
         return decodeWith(d, latentBytes)
     }
 
+    /** Décode via le modèle INT8 (NPU). Fallback float si int8 absent. */
+    @JvmStatic
+    @Synchronized
+    fun decodeI8(latentBytes: ByteArray): ByteArray {
+        val d = decI8 ?: dec ?: throw IllegalStateException("CodecGpu non init (${status()})")
+        return decodeWith(d, latentBytes)
+    }
+
     /** patchBytes (N*1024 indices) → latentBytes (N*1024). Encodeur FLOAT. */
     @JvmStatic
     @Synchronized

@@ -44,7 +44,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHan
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 
-VERSION = '0.5.28'
+VERSION = '0.5.29'
 PORT = int(os.environ.get('HELPER_PORT', '49080'))
 HTTPS_PORT = int(os.environ.get('HELPER_HTTPS_PORT', '49443'))
 DEMO_DIR = Path(__file__).resolve().parent
@@ -2145,6 +2145,35 @@ def _serve_thread(server, label):
         print(f'  {label} crashed: {e}')
 
 
+def _route_int8_if_safe():
+    """Android : route le décode codec vers le modèle INT8 (NPU) via CodecGpu,
+    mais UNIQUEMENT si l'int8 est bit-exact vs float sur CE device (sinon perte
+    silencieuse car le sidecar est calculé pour le float). Vérifié au démarrage
+    par un petit benchInt8 (mismatch=0). Sinon le décode reste sur numpy."""
+    if os.environ.get('REDSTARS_HELPER_PLATFORM') != 'android':
+        return
+    try:
+        import numpy as _np
+        import codec_numpy
+        from com.redstars.app import CodecGpu
+        st = str(CodecGpu.status())
+        if 'error' in st or 'int8=none' in st or 'int8=absent' in st:
+            print(f'  [int8] indisponible ({st}) — decode reste numpy'); return
+        bench = str(CodecGpu.benchInt8(64))
+        if 'mismatch=0/' not in bench:
+            print(f'  [int8] NON bit-exact sur ce device — decode reste numpy ({bench[:90]})'); return
+        _orig = codec_numpy._dec_bytes
+        def _dec_int8(lat_bytes):
+            try:
+                return _np.frombuffer(bytes(CodecGpu.decodeI8(bytes(lat_bytes))), _np.uint8)
+            except Exception:
+                return _orig(lat_bytes)
+        codec_numpy._dec_bytes = _dec_int8
+        print(f'  [int8] decode route vers INT8/NPU (bit-exact OK) — {st} | {bench[:90]}')
+    except Exception as e:
+        print(f'  [int8] routage echoue ({type(e).__name__}: {e}) — decode reste numpy')
+
+
 def main():
     # SO_REUSEADDR : sur Android, l'OS garde le socket 30-120 s en TIME_WAIT
     # après un crash du process. Sans REUSEADDR, le redémarrage de l'app
@@ -2156,6 +2185,7 @@ def main():
     http_srv = HTTPServer(('0.0.0.0', PORT), Handler)
     print(f'redstars-helper {VERSION}')
     print(f'  static files from {DEMO_DIR}')
+    _route_int8_if_safe()   # Android : décode codec via INT8/NPU si bit-exact
 
     print(f'  HTTP  http://0.0.0.0:{PORT}/  +  /helper/*')
 
