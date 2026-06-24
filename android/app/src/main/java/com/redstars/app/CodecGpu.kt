@@ -95,8 +95,8 @@ object CodecGpu {
         var batch = 0
         while (batch < n) {
             val bsz = minOf(B, n - batch)
+            inBuf.rewind()
             val fin = inBuf.asFloatBuffer()
-            fin.rewind()
             // remplit [B,32,32,8] (les patchs >= bsz restent à 0)
             val zero = FloatArray(32 * 32 * 8)
             for (p in 0 until B) {
@@ -115,6 +115,7 @@ object CodecGpu {
             }
             inBuf.rewind(); outBuf.rewind()
             d.run(inBuf, outBuf)
+            outBuf.rewind()
             val iout = outBuf.asIntBuffer()
             for (p in 0 until bsz) {
                 val base = (batch + p) * PATCH
@@ -138,7 +139,8 @@ object CodecGpu {
         var batch = 0
         while (batch < n) {
             val bsz = minOf(B, n - batch)
-            val fin = inBuf.asFloatBuffer(); fin.rewind()
+            inBuf.rewind()
+            val fin = inBuf.asFloatBuffer()
             val zero = FloatArray(32 * 32 * 8)
             for (p in 0 until B) {
                 if (p < bsz) {
@@ -154,6 +156,7 @@ object CodecGpu {
             }
             inBuf.rewind(); outBuf.rewind()
             e.run(inBuf, outBuf)
+            outBuf.rewind()
             val fout = outBuf.asFloatBuffer()
             for (p in 0 until bsz) {
                 val base = (batch + p) * PATCH
