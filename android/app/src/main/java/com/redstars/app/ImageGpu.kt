@@ -17,15 +17,14 @@ import java.nio.channels.FileChannel
  * Modèle dec256.tflite (I/O VÉRIFIÉE, int8 PTQ) :
  *   INPUT  : int8 [1,32,32,4] NHWC, scale=0.0235294122248888 zp=0
  *            (latent fourni en NCHW : index = c*1024 + h*32 + w)
- *   OUTPUT : int8 [1,256,256,256] NHWC (C = 256 logits de classe palette),
- *            scale=0.21682730317115784 zp=4
- *   → argmax sur C donne l'indice palette ; l'argmax des logits int8 == argmax
- *     des logits déquantifiés, donc pas de déquant nécessaire.
+ *   OUTPUT : int32 [1,256,256] = 65536 indices palette (0..255), row-major
+ *            (index = h*256 + w). L'ARGMAX EST BAKÉE DANS LE MODÈLE (NPU),
+ *            donc plus de scan des 256 canaux côté CPU.
  *
  * On quantifie l'entrée nous-mêmes (la quantification est bakée dans le modèle).
- * Le gros buffer de sortie 16 Mo est alloué UNE fois et réutilisé (évite le GC
- * par appel). Discipline rewind identique à CodecGpu (rewind output après run(),
- * rewind input avant remplissage).
+ * Le buffer de sortie (262 Ko, int32) est alloué UNE fois et réutilisé (évite le
+ * GC par appel). Discipline rewind identique à CodecGpu (rewind output après
+ * run(), rewind input avant remplissage).
  */
 object ImageGpu {
     private const val IN_H = 32
@@ -37,7 +36,7 @@ object ImageGpu {
     private const val IN_SCALE = 0.0235294122248888
     private const val LATENT = 4096            // 4 * 1024
     private const val OUT_PIXELS = OUT_H * OUT_W   // 65536
-    private const val OUT_BYTES = OUT_H * OUT_W * OUT_C  // 16_777_216
+    private const val OUT_BYTES = OUT_PIXELS * 4   // 262_144 — int32 [1,256,256] (argmax bakée NPU)
 
     // Encodeur (enc256.tflite) — int16 (activations int16, I/O = Short) :
     //   INPUT  : int16 [1,256,256,3] NHWC, scale=3.0518e-05 (=1/32768) zp=0
@@ -145,20 +144,11 @@ object ImageGpu {
         d.run(ib, ob)
         ob.rewind()
 
-        // 3) Argmax sur C (logits int8 signés). Pas de déquant nécessaire.
+        // 3) L'argmax est bakée dans le modèle : la sortie int32 [1,256,256]
+        //    EST directement les indices palette (0..255), row-major h*256+w.
         val out = ByteArray(OUT_PIXELS)
-        for (h in 0 until OUT_H) {
-            for (w in 0 until OUT_W) {
-                val base = (h * OUT_W + w) * OUT_C
-                var best = ob.get(base).toInt()
-                var bestC = 0
-                for (c in 1 until OUT_C) {
-                    val logit = ob.get(base + c).toInt()
-                    if (logit > best) { best = logit; bestC = c }
-                }
-                out[h * OUT_W + w] = bestC.toByte()
-            }
-        }
+        val iob = ob.asIntBuffer()
+        for (i in 0 until OUT_PIXELS) out[i] = iob.get(i).toByte()
         return out
     }
 
