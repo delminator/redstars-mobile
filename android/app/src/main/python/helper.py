@@ -44,7 +44,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHan
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 
-VERSION = '0.5.33'
+VERSION = '0.5.35'
 PORT = int(os.environ.get('HELPER_PORT', '49080'))
 HTTPS_PORT = int(os.environ.get('HELPER_HTTPS_PORT', '49443'))
 DEMO_DIR = Path(__file__).resolve().parent
@@ -1243,6 +1243,20 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._json(500, {'error': f'{type(e).__name__}: {e}'})
             return
+        if ep == '/codec/image-bench':
+            # Bench du décodeur IMAGE 256×256 sur le NPU (ImageGpu.benchImage). Android.
+            if os.environ.get('REDSTARS_HELPER_PLATFORM') != 'android':
+                self._json(200, {'skip': "desktop — pas d'ImageGpu natif"}); return
+            try:
+                from com.redstars.app import ImageGpu
+                n = max(4, min(512, int((query.get('n', ['64']) or ['64'])[0])))
+                r = {'status': str(ImageGpu.status()), 'decode': str(ImageGpu.benchImage(n))}
+                try: r['encode'] = str(ImageGpu.benchImageEncode(max(2, n // 4)))
+                except Exception as ee: r['encode'] = f'(encode bench KO: {type(ee).__name__}: {ee})'
+                self._json(200, r)
+            except Exception as e:
+                self._json(500, {'error': f'{type(e).__name__}: {e}'})
+            return
         if ep == '/codec/list-savedir':
             # Liste les fichiers du dossier RedStars (pour picker sans navigateur sur mobile).
             try:
@@ -1436,6 +1450,41 @@ class Handler(SimpleHTTPRequestHandler):
                 lat = self.rfile.read(n) if n > 0 else b''
                 out = codec_numpy._dec_bytes(lat)
                 self._raw(200, _np.asarray(out, _np.uint8).tobytes())
+            except Exception as e:
+                self._json(500, {'error': f'{type(e).__name__}: {e}'})
+            return
+        if ep == '/codec/image-decode':
+            # latent (4096 floats f32-LE, NCHW) -> indices palette 256×256 (65536 o)
+            # via le décodeur image INT8 sur le NPU (ImageGpu). Android uniquement ;
+            # le render POST son latent ici au lieu de décoder en WebGL2.
+            if os.environ.get('REDSTARS_HELPER_PLATFORM') != 'android':
+                self._json(200, {'skip': "desktop — pas d'ImageGpu natif"}); return
+            try:
+                from com.redstars.app import ImageGpu
+                import numpy as _np
+                n = int(self.headers.get('Content-Length', '0') or 0)
+                body = self.rfile.read(n) if n > 0 else b''
+                lat = _np.frombuffer(body, _np.float32)
+                if lat.size != 4096:
+                    self._json(400, {'error': f'latent attendu 4096 floats, reçu {lat.size}'}); return
+                self._raw(200, bytes(ImageGpu.decodeImage(lat.tolist())))
+            except Exception as e:
+                self._json(500, {'error': f'{type(e).__name__}: {e}'})
+            return
+        if ep == '/codec/image-encode':
+            # RGB (256*256*3 o uint8) -> latent (4096 floats f32-LE, NCHW) via
+            # l'encodeur image INT8/int16 sur le NPU (ImageGpu.encodeImage). Android.
+            if os.environ.get('REDSTARS_HELPER_PLATFORM') != 'android':
+                self._json(200, {'skip': "desktop — pas d'ImageGpu natif"}); return
+            try:
+                from com.redstars.app import ImageGpu
+                import numpy as _np
+                n = int(self.headers.get('Content-Length', '0') or 0)
+                body = self.rfile.read(n) if n > 0 else b''
+                if len(body) != 256 * 256 * 3:
+                    self._json(400, {'error': f'RGB attendu {256*256*3} o, reçu {len(body)}'}); return
+                lat = _np.asarray(ImageGpu.encodeImage(body), _np.float32)
+                self._raw(200, lat.tobytes())
             except Exception as e:
                 self._json(500, {'error': f'{type(e).__name__}: {e}'})
             return
