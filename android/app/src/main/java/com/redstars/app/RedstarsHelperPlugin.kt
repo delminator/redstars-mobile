@@ -74,7 +74,6 @@ class RedstarsHelperPlugin : Plugin() {
                 // Inférence GPU du codec (TFLite) — init avant que le helper Python
                 // ne l'appelle. Pur Kotlin, sans Python. Best-effort.
                 try { CodecGpu.init(ctx) } catch (e: Throwable) { Log.w(TAG, "CodecGpu.init failed", e) }
-                try { ImageGpu.init(ctx) } catch (e: Throwable) { Log.w(TAG, "ImageGpu.init failed", e) }
                 if (!Python.isStarted()) {
                     Log.i(TAG, "Starting Python runtime (first launch may take 3-5 s)")
                     Python.start(AndroidPlatform(ctx))
