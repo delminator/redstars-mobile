@@ -88,6 +88,13 @@ class RedstarsHelperPlugin : Plugin() {
                     cacheDir.parentFile?.absolutePath ?: cacheDir.absolutePath
                 )
                 environ.callAttr("__setitem__", "REDSTARS_HELPER_PLATFORM", "android")
+                // Dossier de sortie ACCESSIBLE (USB / gestionnaire de fichiers, sans
+                // permission) : getExternalFilesDir le crée, donc le helper Python peut
+                // y écrire (sinon son test mkdir échouait → fallback cache non navigable).
+                try {
+                    val extSave = File(ctx.getExternalFilesDir(null), "RedStars").apply { mkdirs() }
+                    environ.callAttr("__setitem__", "REDSTARS_HELPER_SAVE_DIR", extSave.absolutePath)
+                } catch (e: Throwable) { Log.w(TAG, "getExternalFilesDir KO", e) }
 
                 // Auto-update : on tente une mise à jour avant de lancer
                 // helper.main(). Si le cache contient déjà la dernière

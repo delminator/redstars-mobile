@@ -44,7 +44,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHan
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 
-VERSION = '0.5.29'
+VERSION = '0.5.33'
 PORT = int(os.environ.get('HELPER_PORT', '49080'))
 HTTPS_PORT = int(os.environ.get('HELPER_HTTPS_PORT', '49443'))
 DEMO_DIR = Path(__file__).resolve().parent
@@ -503,62 +503,37 @@ def _iso_payload_from_paths(abs_paths):
     return payload, files_meta
 
 def _codec_encode_worker(job_id, abs_paths, label):
-    """ISO → blob lossless (codec_file_torch) + CASCADE redEC → 1 hash unique.
-    Le hash est la contraction redEC (les 1024 hashes → 1), miroir de redDEC ; on
-    le remonte via /redDEC-chain (1 hash → 1024 → … → 1 Go). Contraction lossy sur
-    données arbitraires (assumé pour l'instant) — le blob reste l'artefact exact."""
+    """Save : fichiers → make_iso → HASH INT8 (latents codec_numpy) stocké helper-side.
+    Plus de blob ni de sidecar ni de cascade : le hash int8 EST l'artefact, décodé
+    exactement par le réseau infaillible. Hash ≈ taille ISO (1:1, pas de compression)."""
     try:
+        import codec_numpy, numpy as _np
         payload, files_meta = _iso_payload_from_paths(abs_paths)
         iso_path = make_iso(label, payload=payload)
-        # Tamponner la zone système ISO (1024 o de tête, ignorée par les lecteurs ISO)
-        # avec un en-tête NON-NUL dérivé du contenu → redEC_chain sort un hash non-nul
-        # ET distinct par disque (sinon l'ISO commence par des zéros → hash nul).
-        import hashlib as _hl
-        sig = _hl.sha256(repr(files_meta).encode() + label.encode()).digest()
-        stamp = (b'RSDISK1\x00' + sig + label.encode()[:48]).ljust(1024, b'\xa5')[:1024]
-        with open(iso_path, 'r+b') as f:
-            f.seek(0); f.write(stamp)
-        source_bytes = iso_path.stat().st_size
+        iso = iso_path.read_bytes()
+        source_bytes = len(iso)
+        pad = (-source_bytes) % codec_numpy.BLOCK
+        arr = _np.frombuffer(iso + b'\x00' * pad, _np.uint8)
+        _, lat = codec_numpy._enc_blocks(arr)               # latents = le hash int8
         BLOB_DIR.mkdir(parents=True, exist_ok=True)
-        blob_id = uuid.uuid4().hex[:16]
-        blob_path = BLOB_DIR / f'{blob_id}.rsn'
-        _, n_patches = _CODEC['encode_file'](str(iso_path), str(blob_path))   # lossless (ISO tamponnée)
-        # CASCADE redEC : ISO (1024 hashes/blocs) → 1 hash unique (Red1..Red4).
-        # OPTIONNELLE : nécessite torch. Sans torch, on ne fournit que le blob.
-        share = {}
-        if not _CODEC.get('redEC_chain'):
-            share = {'share_error': 'cascade indisponible (torch absent — blob seul)'}
-        else:
-            try:
-                import tempfile as _tf
-                out_h = Path(_tf.gettempdir()) / f'redec-{uuid.uuid4().hex[:8]}.bin'
-                lvl, h, insize = _CODEC['redEC_chain'](iso_path, out_h)
-                share = {'share_hash_hex': h.hex(), 'share_level': lvl, 'share_bundle': insize}
-                try: out_h.unlink(missing_ok=True)
-                except Exception: pass
-            except Exception as e:
-                share = {'share_error': f'{type(e).__name__}: {e}'}
+        hash_id = uuid.uuid4().hex[:16]
+        (BLOB_DIR / f'{hash_id}.hash').write_bytes(bytes(lat))
         try: iso_path.unlink(missing_ok=True)
         except Exception: pass
         _job_set(job_id, status='done', progress=1.0, done_at=time.time(), result={
-            'blob_id': blob_id,
-            'blob_bytes': blob_path.stat().st_size,
-            'source_bytes': source_bytes,
-            'patches': n_patches,
+            'hash_id': hash_id,
+            'hash_bytes': len(lat),
+            'source_bytes': source_bytes,     # taille ISO → pour tronquer au restore
             'n_files': len(files_meta),
             'files': files_meta,
             'label': label,
-            **share,
         })
     except Exception as e:
         _job_set(job_id, status='failed', done_at=time.time(), error=f'{type(e).__name__}: {e}')
 
-def _decode_blob_and_mount(blob_path, label):
-    """decode_file(blob) → iso → mount. Returns the MountInfo-shaped result dict."""
-    ISO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    iso_id = uuid.uuid4().hex[:12]
-    iso_path = ISO_CACHE_DIR / f'{iso_id}.iso'
-    _CODEC['decode_file'](str(blob_path), str(iso_path))
+def _mount_iso_result(iso_path, iso_id, label):
+    """ISO (déjà écrite) → mount + list. Returns the MountInfo-shaped result dict.
+    Partagé entre le décode blob (legacy) et le décode hash int8."""
     mount_path, dev, mount_error = None, None, None
     try:
         mount_path, dev = mount_iso(iso_path)
@@ -572,32 +547,45 @@ def _decode_blob_and_mount(blob_path, label):
     if mount_error: result['mount_error'] = mount_error
     return result
 
-def _codec_restore_worker(job_id, blob_id, label):
-    """blob (par id, stocké helper-side) → decode → mount."""
+
+def _hash_to_iso_and_mount(hash_bytes, iso_bytes, label):
+    """hash int8 (latents) → décode int8/NPU → ISO (tronquée à iso_bytes) → mount/list.
+    Pas de blob ni sidecar : on s'appuie sur le réseau infaillible (round-trip 0)."""
+    import codec_numpy, numpy as _np
+    raw = _np.asarray(codec_numpy._dec_bytes(bytes(hash_bytes)), _np.uint8).tobytes()
+    if iso_bytes and iso_bytes > 0:
+        raw = raw[:iso_bytes]
+    ISO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    iso_id = uuid.uuid4().hex[:12]
+    iso_path = ISO_CACHE_DIR / f'{iso_id}.iso'
+    iso_path.write_bytes(raw)
+    return _mount_iso_result(iso_path, iso_id, label)
+
+
+def _decode_blob_and_mount(blob_path, label):
+    """decode_file(blob) → iso → mount. Returns the MountInfo-shaped result dict."""
+    ISO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    iso_id = uuid.uuid4().hex[:12]
+    iso_path = ISO_CACHE_DIR / f'{iso_id}.iso'
+    _CODEC['decode_file'](str(blob_path), str(iso_path))
+    return _mount_iso_result(iso_path, iso_id, label)
+
+def _codec_restore_worker(job_id, hash_id, iso_bytes, label):
+    """hash int8 (par id, stocké helper-side) → décode int8/NPU → ISO → mount."""
     try:
-        blob_path = BLOB_DIR / f'{blob_id}.rsn'
-        if not blob_path.is_file():
-            _job_set(job_id, status='failed', done_at=time.time(), error=f'no such blob: {blob_id}'); return
+        hp = BLOB_DIR / f'{hash_id}.hash'
+        if not hp.is_file():
+            _job_set(job_id, status='failed', done_at=time.time(), error=f'no such hash: {hash_id}'); return
         _job_set(job_id, status='done', progress=1.0, done_at=time.time(),
-                 result=_decode_blob_and_mount(blob_path, label))
+                 result=_hash_to_iso_and_mount(hp.read_bytes(), iso_bytes, label))
     except Exception as e:
         _job_set(job_id, status='failed', done_at=time.time(), error=f'{type(e).__name__}: {e}')
 
-def _codec_restore_data_worker(job_id, blob_bytes, label):
-    """blob collé (base64, venu d'ailleurs) → decode → mount. Pour tester un blob
-    encodé sur une autre machine sans qu'il soit déjà dans le store local."""
+def _codec_restore_data_worker(job_id, hash_bytes, iso_bytes, label):
+    """hash int8 collé (venu d'ailleurs) → décode int8 → ISO → mount."""
     try:
-        if blob_bytes[:4] != b'RSN1':
-            _job_set(job_id, status='failed', done_at=time.time(), error='blob invalide (magic ≠ RSN1)'); return
-        BLOB_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = BLOB_DIR / f'paste-{uuid.uuid4().hex[:12]}.rsn'
-        tmp.write_bytes(blob_bytes)
-        try:
-            _job_set(job_id, status='done', progress=1.0, done_at=time.time(),
-                     result=_decode_blob_and_mount(tmp, label))
-        finally:
-            try: tmp.unlink(missing_ok=True)
-            except Exception: pass
+        _job_set(job_id, status='done', progress=1.0, done_at=time.time(),
+                 result=_hash_to_iso_and_mount(hash_bytes, iso_bytes, label))
     except Exception as e:
         _job_set(job_id, status='failed', done_at=time.time(), error=f'{type(e).__name__}: {e}')
 
@@ -1135,6 +1123,13 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _raw(self, code, body):
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _read_json(self):
         n = int(self.headers.get('Content-Length', '0') or 0)
         if n <= 0:
@@ -1245,6 +1240,16 @@ class Handler(SimpleHTTPRequestHandler):
                     'status': str(CodecGpu.status()),
                     'result': str(CodecGpu.benchInt8(n)),
                 })
+            except Exception as e:
+                self._json(500, {'error': f'{type(e).__name__}: {e}'})
+            return
+        if ep == '/codec/list-savedir':
+            # Liste les fichiers du dossier RedStars (pour picker sans navigateur sur mobile).
+            try:
+                d = _save_dir()
+                files = sorted(({'name': f.name, 'bytes': f.stat().st_size}
+                                for f in d.iterdir() if f.is_file()), key=lambda x: x['name'])
+                self._json(200, {'dir': str(d), 'files': files})
             except Exception as e:
                 self._json(500, {'error': f'{type(e).__name__}: {e}'})
             return
@@ -1410,6 +1415,92 @@ class Handler(SimpleHTTPRequestHandler):
         split = urlsplit(self.path)
         ep    = split.path[len('/helper'):]
         query = parse_qs(split.query)
+        if ep == '/codec/encode-hash':
+            # data brute -> hash (latents purs, SANS blob/sidecar). Padding zéro à 1024.
+            try:
+                import codec_numpy, numpy as _np
+                n = int(self.headers.get('Content-Length', '0') or 0)
+                raw = self.rfile.read(n) if n > 0 else b''
+                pad = (-len(raw)) % codec_numpy.BLOCK
+                arr = _np.frombuffer(raw + b'\x00' * pad, _np.uint8)
+                _, lat = codec_numpy._enc_blocks(arr)
+                self._raw(200, bytes(lat))
+            except Exception as e:
+                self._json(500, {'error': f'{type(e).__name__}: {e}'})
+            return
+        if ep == '/codec/decode-hash':
+            # hash (latents purs) -> data brute (N*1024). Décode via INT8/NPU si routé.
+            try:
+                import codec_numpy, numpy as _np
+                n = int(self.headers.get('Content-Length', '0') or 0)
+                lat = self.rfile.read(n) if n > 0 else b''
+                out = codec_numpy._dec_bytes(lat)
+                self._raw(200, _np.asarray(out, _np.uint8).tobytes())
+            except Exception as e:
+                self._json(500, {'error': f'{type(e).__name__}: {e}'})
+            return
+        if ep == '/codec/encode-hash-save':
+            # data brute (body) -> hash (latents) enregistré sur l'appareil. ?name=
+            try:
+                import codec_numpy, numpy as _np
+                name = (query.get('name', ['fichier.hash']) or ['fichier.hash'])[0]
+                n = int(self.headers.get('Content-Length', '0') or 0)
+                raw = self.rfile.read(n) if n > 0 else b''
+                pad = (-len(raw)) % codec_numpy.BLOCK
+                arr = _np.frombuffer(raw + b'\x00' * pad, _np.uint8)
+                _, lat = codec_numpy._enc_blocks(arr)
+                p = _save_dir() / os.path.basename(name)
+                p.write_bytes(bytes(lat))
+                self._json(200, {'saved_path': str(p), 'in_bytes': len(raw), 'hash_bytes': len(lat)})
+            except Exception as e:
+                self._json(500, {'error': f'{type(e).__name__}: {e}'})
+            return
+        if ep == '/codec/decode-hash-save':
+            # hash (latents, body) -> data décodée (INT8/NPU) enregistrée sur l'appareil. ?name=
+            try:
+                import codec_numpy, numpy as _np
+                name = (query.get('name', ['fichier.bin']) or ['fichier.bin'])[0]
+                n = int(self.headers.get('Content-Length', '0') or 0)
+                lat = self.rfile.read(n) if n > 0 else b''
+                out = _np.asarray(codec_numpy._dec_bytes(lat), _np.uint8).tobytes()
+                p = _save_dir() / os.path.basename(name)
+                p.write_bytes(out)
+                self._json(200, {'saved_path': str(p), 'hash_bytes': len(lat), 'out_bytes': len(out)})
+            except Exception as e:
+                self._json(500, {'error': f'{type(e).__name__}: {e}'})
+            return
+        if ep == '/codec/encode-file-hash':
+            # {name} d'un fichier du dossier RedStars -> hash (latents) au même endroit.
+            try:
+                import codec_numpy, numpy as _np
+                name = os.path.basename(self._read_json().get('name', ''))
+                src = _save_dir() / name
+                if not name or not src.is_file():
+                    self._json(404, {'error': f'introuvable: {name}'}); return
+                raw = src.read_bytes(); pad = (-len(raw)) % codec_numpy.BLOCK
+                arr = _np.frombuffer(raw + b'\x00' * pad, _np.uint8)
+                _, lat = codec_numpy._enc_blocks(arr)
+                p = _save_dir() / (name + '.hash'); p.write_bytes(bytes(lat))
+                self._json(200, {'saved_path': str(p), 'name': name + '.hash', 'in_bytes': len(raw), 'hash_bytes': len(lat)})
+            except Exception as e:
+                self._json(500, {'error': f'{type(e).__name__}: {e}'})
+            return
+        if ep == '/codec/decode-file-hash':
+            # {name} d'un fichier hash du dossier RedStars -> data décodée (INT8/NPU) au même endroit.
+            try:
+                import codec_numpy, numpy as _np
+                name = os.path.basename(self._read_json().get('name', ''))
+                src = _save_dir() / name
+                if not name or not src.is_file():
+                    self._json(404, {'error': f'introuvable: {name}'}); return
+                lat = src.read_bytes()
+                out = _np.asarray(codec_numpy._dec_bytes(lat), _np.uint8).tobytes()
+                outname = name[:-5] if name.endswith('.hash') else name + '.decoded'
+                p = _save_dir() / outname; p.write_bytes(out)
+                self._json(200, {'saved_path': str(p), 'name': outname, 'hash_bytes': len(lat), 'out_bytes': len(out)})
+            except Exception as e:
+                self._json(500, {'error': f'{type(e).__name__}: {e}'})
+            return
         if ep == '/enable-webgpu':
             profile = find_firefox_default_profile()
             if profile is None:
@@ -1732,10 +1823,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if ep == '/codec/encode':
-            # Save : files → make_iso → encode_file → blob (lossless). Async job.
-            err = _ensure_codec()
-            if err:
-                self._json(500, {'error': f'codec load failed: {err}', 'hint': 'pip install torch numpy'}); return
+            # Save : files → make_iso → HASH INT8 (codec_numpy, sans torch). Async job.
             body  = self._read_json()
             paths = body.get('paths') or []
             label = (body.get('label') or 'REDSTARS')[:32]
@@ -1758,36 +1846,27 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(200, {'job_id': job_id}); return
 
         if ep == '/codec/restore':
-            # Remonter : blob → decode_file → iso → mount (lossless). Async job.
-            err = _ensure_codec()
-            if err:
-                self._json(500, {'error': f'codec load failed: {err}', 'hint': 'pip install torch numpy'}); return
-            body    = self._read_json()
-            blob_id = (body.get('blob_id') or '').strip()
-            label   = (body.get('label') or 'BUNDLE')[:32]
-            if not re.fullmatch(r'[0-9a-f]{8,32}', blob_id):
-                self._json(400, {'error': 'blob_id required (hex)'}); return
+            # Remonter : hash int8 (par id) → décode int8 → iso → mount. Async job.
+            body      = self._read_json()
+            hash_id   = (body.get('hash_id') or '').strip()
+            iso_bytes = int(body.get('iso_bytes') or 0)
+            label     = (body.get('label') or 'BUNDLE')[:32]
+            if not re.fullmatch(r'[0-9a-f]{8,32}', hash_id):
+                self._json(400, {'error': 'hash_id required (hex)'}); return
             job_id = _new_job('codec-restore')
-            threading.Thread(target=_codec_restore_worker, args=(job_id, blob_id, label), daemon=True).start()
+            threading.Thread(target=_codec_restore_worker, args=(job_id, hash_id, iso_bytes, label), daemon=True).start()
             self._json(200, {'job_id': job_id}); return
 
         if ep == '/codec/restore-data':
-            # Remonter un blob COLLÉ (base64, encodé ailleurs). Async job.
-            err = _ensure_codec()
-            if err:
-                self._json(500, {'error': f'codec load failed: {err}', 'hint': 'pip install torch numpy'}); return
+            # Remonter un hash int8 COLLÉ (hex, encodé ailleurs). Async job.
             body  = self._read_json()
-            b64   = (body.get('blob_b64') or '').strip()
+            hex_  = (body.get('hash_hex') or '').strip().lower().replace(' ', '')
+            iso_bytes = int(body.get('iso_bytes') or 0)
             label = (body.get('label') or 'BUNDLE')[:32]
-            import base64 as _b64
-            try:
-                data = _b64.b64decode(b64, validate=True)
-            except Exception:
-                self._json(400, {'error': 'blob_b64 invalide (base64)'}); return
-            if len(data) < 12 or data[:4] != b'RSN1':
-                self._json(400, {'error': 'blob invalide (magic ≠ RSN1)'}); return
+            if not re.fullmatch(r'[0-9a-f]+', hex_) or len(hex_) % 2048 != 0:
+                self._json(400, {'error': 'hash_hex invalide (hex, multiple de 2048)'}); return
             job_id = _new_job('codec-restore-data')
-            threading.Thread(target=_codec_restore_data_worker, args=(job_id, data, label), daemon=True).start()
+            threading.Thread(target=_codec_restore_data_worker, args=(job_id, bytes.fromhex(hex_), iso_bytes, label), daemon=True).start()
             self._json(200, {'job_id': job_id}); return
 
         if ep == '/codec/iso-list':
