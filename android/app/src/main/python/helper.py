@@ -2267,6 +2267,20 @@ def _route_int8_if_safe():
                     return _orig_enc(raw)
             codec_numpy._enc_blocks = _enc_int8
             print(f'  [int8] encode route vers INT8/NPU (bit-exact OK) — {enc_bench[:90]}')
+            # Le sidecar (dans encode()/encode_file()) appelle dec_forward(z) DIRECTEMENT
+            # (pas _dec_bytes) → ce decode de verif restait sur CPU et dominait le cout de
+            # l'encode. On le route AUSSI vers le NPU (decode deja prouve bit-exact) →
+            # encode 100% NPU (les 2 passes : enc + decode-sidecar), ~2x plus rapide.
+            _orig_dfwd = codec_numpy.dec_forward
+            def _dfwd_int8(z):
+                try:
+                    lat = _np.packbits(z.reshape(len(z), -1), axis=1).tobytes()
+                    return _np.frombuffer(bytes(CodecGpu.decodeI8(lat)),
+                                          _np.uint8).reshape(len(z), 32, 32)
+                except Exception:
+                    return _orig_dfwd(z)
+            codec_numpy.dec_forward = _dfwd_int8
+            print('  [int8] sidecar dec_forward route aussi vers INT8/NPU (encode 100% NPU)')
         else:
             print(f'  [int8] encode NON bit-exact — encode reste numpy ({enc_bench[:90]})')
     except Exception as e:
