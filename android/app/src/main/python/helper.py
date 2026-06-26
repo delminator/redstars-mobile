@@ -44,7 +44,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHan
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 
-VERSION = '0.5.36'
+VERSION = '0.5.37'
 PORT = int(os.environ.get('HELPER_PORT', '49080'))
 HTTPS_PORT = int(os.environ.get('HELPER_HTTPS_PORT', '49443'))
 DEMO_DIR = Path(__file__).resolve().parent
@@ -2249,8 +2249,28 @@ def _route_int8_if_safe():
                 return _orig(lat_bytes)
         codec_numpy._dec_bytes = _dec_int8
         print(f'  [int8] decode route vers INT8/NPU (bit-exact OK) — {st} | {bench[:90]}')
+        # Encode int8 : même garantie (int8-enc == float-enc bit-exact, vérifié). On
+        # route _enc_blocks vers CodecGpu.encodeI8 (le conv tourne sur NPU) et on
+        # reconstruit z par unpackbits pour que le sidecar de correction (calculé dans
+        # encode()/encode_file() à partir de z) reste rigoureusement identique.
+        enc_bench = str(CodecGpu.benchEncodeInt8(64))
+        if 'enc_int8_vs_float_mismatch=0/' in enc_bench:
+            _orig_enc = codec_numpy._enc_blocks
+            def _enc_int8(raw):
+                try:
+                    lat = bytes(CodecGpu.encodeI8(raw.tobytes()))
+                    b = len(raw) // 1024
+                    z = _np.unpackbits(_np.frombuffer(lat, _np.uint8).reshape(b, 1024),
+                                       axis=1).reshape(b, 8, 32, 32)
+                    return z, lat
+                except Exception:
+                    return _orig_enc(raw)
+            codec_numpy._enc_blocks = _enc_int8
+            print(f'  [int8] encode route vers INT8/NPU (bit-exact OK) — {enc_bench[:90]}')
+        else:
+            print(f'  [int8] encode NON bit-exact — encode reste numpy ({enc_bench[:90]})')
     except Exception as e:
-        print(f'  [int8] routage echoue ({type(e).__name__}: {e}) — decode reste numpy')
+        print(f'  [int8] routage echoue ({type(e).__name__}: {e}) — decode/encode reste numpy')
 
 
 def main():

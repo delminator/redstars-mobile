@@ -146,6 +146,19 @@ object CodecGpu {
     @Synchronized
     fun encode(patchBytes: ByteArray): ByteArray {
         val e = enc ?: throw IllegalStateException("CodecGpu non init (${status()})")
+        return encodeWith(e, patchBytes)
+    }
+
+    /** Encode via le modèle INT8 (NPU). Fallback float si int8 absent.
+     *  Sûr : int8-enc == float-enc bit-exact (vérifié) → même sidecar de correction. */
+    @JvmStatic
+    @Synchronized
+    fun encodeI8(patchBytes: ByteArray): ByteArray {
+        val e = encI8 ?: enc ?: throw IllegalStateException("CodecGpu non init (${status()})")
+        return encodeWith(e, patchBytes)
+    }
+
+    private fun encodeWith(e: Interpreter, patchBytes: ByteArray): ByteArray {
         val n = patchBytes.size / PATCH
         val out = ByteArray(n * PATCH)
         val inBuf = newFloatIn()
@@ -212,6 +225,32 @@ object CodecGpu {
                 "| speedup=${"%.2f".format(fMs / iMs)}x | int8_vs_float_mismatch=$mism/${n * PATCH}o"
         } catch (e: Throwable) {
             return "benchInt8 error: ${e.javaClass.simpleName}: ${e.message}"
+        }
+    }
+
+    /** Bench/check de l'encode INT8 vs FLOAT sur n patches aléatoires (pour le routage runtime). */
+    @JvmStatic
+    fun benchEncodeInt8(n: Int): String {
+        try {
+            val e = enc ?: return "float enc non chargé (${status()})"
+            val ei8 = encI8 ?: return "int8 enc non chargé (asset enc32_int8 manquant ?) — ${status()}"
+            val rnd = java.util.Random(3)
+            val patches = ByteArray(n * PATCH).also { rnd.nextBytes(it) }
+            encodeWith(e, ByteArray(PATCH)); encodeWith(ei8, ByteArray(PATCH))  // warmup
+            var t = System.nanoTime()
+            val of = encodeWith(e, patches)
+            val fMs = (System.nanoTime() - t) / 1e6
+            t = System.nanoTime()
+            val oi = encodeWith(ei8, patches)
+            val iMs = (System.nanoTime() - t) / 1e6
+            var mism = 0
+            for (k in 0 until n * PATCH) if (of[k] != oi[k]) mism++
+            val mb = n * 1024.0 / 1e6
+            return "n=$n | FLOAT[$backendName] ${"%.0f".format(fMs)}ms=${"%.2f".format(mb / (fMs / 1000))}Mo/s " +
+                "| INT8[$backendI8] ${"%.0f".format(iMs)}ms=${"%.2f".format(mb / (iMs / 1000))}Mo/s " +
+                "| speedup=${"%.2f".format(fMs / iMs)}x | enc_int8_vs_float_mismatch=$mism/${n * PATCH}o"
+        } catch (e: Throwable) {
+            return "benchEncodeInt8 error: ${e.javaClass.simpleName}: ${e.message}"
         }
     }
 
