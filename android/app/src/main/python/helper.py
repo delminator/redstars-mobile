@@ -44,7 +44,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHan
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 
-VERSION = '0.5.38'
+VERSION = '0.5.39'
 PORT = int(os.environ.get('HELPER_PORT', '49080'))
 HTTPS_PORT = int(os.environ.get('HELPER_HTTPS_PORT', '49443'))
 DEMO_DIR = Path(__file__).resolve().parent
@@ -170,6 +170,86 @@ SCALE_BAUD = 9600
 SCALE_LINE = re.compile(r'(?P<status>[A-Z]{2,4})\s*(?P<sign>[+-])(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>g|kg|lb|oz|ml)?', re.I)
 
 
+class _StdlibSerial:
+    """Minimal stdlib (termios) serial reader — a pyserial-free fallback so the
+    helper reads the scale without any pip install (the GUI-launched helper often
+    picks a Python without pyserial). Linux only. Implements just the subset
+    ScaleReader uses: in_waiting, readline(), close()."""
+    def __init__(self, port, baud, timeout=0.4):
+        import termios
+        self.timeout = timeout
+        self._buf = b''
+        self.fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            attrs = termios.tcgetattr(self.fd)  # [iflag,oflag,cflag,lflag,ispeed,ospeed,cc]
+            baud_const = getattr(termios, 'B%d' % baud, termios.B9600)
+            attrs[0] = termios.IGNPAR
+            attrs[1] = 0
+            attrs[2] = (attrs[2] & ~termios.CSIZE) | termios.CS8 | termios.CLOCAL | termios.CREAD
+            attrs[2] &= ~(termios.PARENB | termios.CSTOPB)
+            if hasattr(termios, 'CRTSCTS'):
+                attrs[2] &= ~termios.CRTSCTS
+            attrs[3] = 0
+            attrs[4] = baud_const
+            attrs[5] = baud_const
+            termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
+        except Exception:
+            pass  # a pty / odd device may reject some attrs — raw read still works
+
+    @property
+    def in_waiting(self):
+        import array
+        import fcntl
+        import termios
+        buf = array.array('i', [0])
+        try:
+            fcntl.ioctl(self.fd, termios.FIONREAD, buf, True)
+            return buf[0]
+        except Exception:
+            return 0
+
+    def _pump(self):
+        try:
+            data = os.read(self.fd, 4096)
+            if data:
+                self._buf += data
+        except (BlockingIOError, OSError):
+            pass
+
+    def readline(self):
+        deadline = time.time() + self.timeout
+        while b'\n' not in self._buf and b'\r' not in self._buf and time.time() < deadline:
+            self._pump()
+            if b'\n' not in self._buf and b'\r' not in self._buf:
+                time.sleep(0.02)
+        idx = -1
+        for i, c in enumerate(self._buf):
+            if c in (10, 13):
+                idx = i
+                break
+        if idx < 0:
+            line, self._buf = self._buf, b''
+        else:
+            line, self._buf = self._buf[:idx], self._buf[idx + 1:]
+        return line
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except Exception:
+            pass
+
+
+def _open_scale_serial(port, baud, timeout=0.4):
+    """Open the scale serial port. Prefer pyserial; fall back to the stdlib
+    (termios) reader so the helper works even without a pyserial install."""
+    try:
+        import serial
+        return serial.Serial(port, baud, timeout=timeout)
+    except ImportError:
+        return _StdlibSerial(port, baud, timeout=timeout)
+
+
 class ScaleReader:
     """On-demand serial scale reader. There is NO 24/7 background polling: the
     serial port is opened lazily on the first /scale request and kept open only
@@ -282,13 +362,7 @@ class ScaleReader:
             self._last_request = time.time()
             if self._ser is None:
                 try:
-                    import serial
-                except ImportError:
-                    self._last = dict(self._last, connected=False,
-                                      error='pyserial not installed (pip install --user pyserial)')
-                    return dict(self._last)
-                try:
-                    self._ser = serial.Serial(self.port, self.baud, timeout=0.4)
+                    self._ser = _open_scale_serial(self.port, self.baud)
                 except FileNotFoundError:
                     self._last = dict(self._last, connected=False,
                                       error=f'{self.port} not present (scale unplugged?)')
