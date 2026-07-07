@@ -28,6 +28,9 @@ allprojects {
         google()
         mavenCentral()
         maven { url "https://chaquo.com/maven" }
+        // usb-serial-for-android (CH340/CP210x/FTDI/PL2303 drivers) is published
+        // on JitPack — used by UsbScaleBridge to read the USB scale on Android.
+        maven { url "https://jitpack.io" }
     }
 }
 

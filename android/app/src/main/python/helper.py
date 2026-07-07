@@ -44,7 +44,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHan
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 
-VERSION = '0.5.37'
+VERSION = '0.5.38'
 PORT = int(os.environ.get('HELPER_PORT', '49080'))
 HTTPS_PORT = int(os.environ.get('HELPER_HTTPS_PORT', '49443'))
 DEMO_DIR = Path(__file__).resolve().parent
@@ -225,9 +225,59 @@ class ScaleReader:
                 self._arm_timer()
 
     # --- public API ------------------------------------------------------
+    # Freshness window for the Android bridge file: no line newer than this ⇒
+    # treat the scale as disconnected (unplugged / powered off).
+    STALE_MS = 4000
+
+    def _read_from_file(self, path):
+        """Android: an app can't open /dev/ttyUSB0, so the native Kotlin bridge
+        (UsbScaleBridge, usb-serial-for-android) reads the USB scale and writes the
+        freshest line to REDSTARS_SCALE_FILE as '<epoch_ms>\\t<raw>'. Parse it here
+        with the SAME SCALE_LINE regex / return shape as the serial path."""
+        try:
+            with open(path, 'r') as f:
+                content = f.read().strip()
+        except FileNotFoundError:
+            self._last = dict(self._last, connected=False, error='balance bridge: no reading yet')
+            return dict(self._last)
+        except Exception as e:
+            self._last = dict(self._last, connected=False, error=type(e).__name__ + ': ' + str(e))
+            return dict(self._last)
+        if not content or '\t' not in content:
+            self._last = dict(self._last, connected=False, error='balance bridge: no reading yet')
+            return dict(self._last)
+        ts_str, raw = content.split('\t', 1)
+        raw = raw.strip()
+        try:
+            age_ms = time.time() * 1000.0 - float(ts_str)
+        except ValueError:
+            age_ms = None
+        if age_ms is not None and age_ms > self.STALE_MS:
+            self._last = dict(self._last, connected=False, raw=raw, error='scale idle (unplugged?)')
+            return dict(self._last)
+        m = SCALE_LINE.search(raw)
+        if m:
+            sign = -1 if m.group('sign') == '-' else 1
+            self._last = {
+                'connected': True,
+                'value': sign * float(m.group('value')),
+                'unit': (m.group('unit') or 'g').lower(),
+                'sign': m.group('sign'),
+                'status': m.group('status'),
+                'raw': raw,
+                'updated_at': time.time(),
+                'error': None,
+            }
+        else:
+            self._last = dict(self._last, connected=True, raw=raw, updated_at=time.time(), error=None)
+        return dict(self._last)
+
     def read(self):
         """Open on demand, drain to the freshest line, return the reading.
         The port auto-closes IDLE_CLOSE_SECS after the last call."""
+        _bridge = os.environ.get('REDSTARS_SCALE_FILE')
+        if _bridge:
+            return self._read_from_file(_bridge)
         with self.lock:
             self._last_request = time.time()
             if self._ser is None:

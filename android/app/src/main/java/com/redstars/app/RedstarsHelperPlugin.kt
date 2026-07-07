@@ -96,6 +96,17 @@ class RedstarsHelperPlugin : Plugin() {
                     environ.callAttr("__setitem__", "REDSTARS_HELPER_SAVE_DIR", extSave.absolutePath)
                 } catch (e: Throwable) { Log.w(TAG, "getExternalFilesDir KO", e) }
 
+                // USB scale bridge: an Android app can't open /dev/ttyUSB0, so the
+                // scale is read here via the Java USB Host API (usb-serial-for-android,
+                // CH340 supported) and the freshest line is dropped into
+                // REDSTARS_SCALE_FILE. helper.py reads that file on Android instead of
+                // pyserial, keeping the SAME parsing + /helper/scale endpoint.
+                try {
+                    val scaleFile = File(cacheDir, "scale.line")
+                    environ.callAttr("__setitem__", "REDSTARS_SCALE_FILE", scaleFile.absolutePath)
+                    UsbScaleBridge.start(ctx, scaleFile)
+                } catch (e: Throwable) { Log.w(TAG, "UsbScaleBridge start KO", e) }
+
                 // Auto-update : on tente une mise à jour avant de lancer
                 // helper.main(). Si le cache contient déjà la dernière
                 // version, ça n'écrit rien ; sinon download + verify +

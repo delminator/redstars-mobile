@@ -71,6 +71,10 @@ dependencies {
     // appelée depuis le helper Python (Chaquopy) uniquement sur Android.
     implementation 'org.tensorflow:tensorflow-lite:2.16.1'
     implementation 'org.tensorflow:tensorflow-lite-gpu:2.16.1'
+    // USB-serial driver stack (CH340 etc.) — UsbScaleBridge reads the electronic
+    // scale on Android (apps can't open /dev/ttyUSB0; USB goes through the Java
+    // USB Host API). Feeds the freshest line to helper.py via REDSTARS_SCALE_FILE.
+    implementation 'com.github.mik3y:usb-serial-for-android:3.8.1'
     testImplementation "junit:junit:$junitVersion"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"

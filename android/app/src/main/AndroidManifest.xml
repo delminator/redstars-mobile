@@ -58,4 +58,7 @@
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+    <!-- USB Host: read the electronic scale (CH340 USB-serial) via UsbScaleBridge.
+         Not required so the app still installs on devices without USB-OTG. -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
 </manifest>
